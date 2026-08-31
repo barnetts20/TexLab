@@ -36,6 +36,40 @@ bool UNoiseBakeRecipe::Validate(FString& OutError) const
 		}
 	}
 
+	// Bipolar output requires a signed storage format.
+	//
+	// BGRA8 is a UNORM format: the texture unit converts byte/255 to [0,1] in
+	// fixed-function hardware before the value reaches any shader, and filtering
+	// happens in that space too. A signed channel therefore has to be
+	// bias-encoded back into [0,1] on write, which means the texture viewer
+	// shows it as unsigned, a raymarch samples it as unsigned, and the field
+	// only reads correctly if every consumer remembers to apply the recorded
+	// decode. Nothing about the asset signals that requirement, so the failure
+	// is silent and looks like a bake problem rather than a sampling one.
+	//
+	// It also halves precision, spending 256 levels across [-1,1] for a step of
+	// about 1/127, and warp error is amplified by the gradient of whatever it
+	// displaces. Between paying 2x memory for 2x precision and no decode step,
+	// or saving memory for a silent trap, the former is the better trade often
+	// enough that the latter is not worth offering.
+	if (OutputFormat != ENoiseOutputFormat::RGBA16F)
+	{
+		for (int32 Index = 0; Index < 4; ++Index)
+		{
+			if (Channels[Index].bBipolarOutput)
+			{
+				OutError = FString::Printf(
+					TEXT("Channel %s has bBipolarOutput set, but OutputFormat is BGRA8. BGRA8 is an ")
+					TEXT("unsigned format, so the signed value would be bias-encoded back into [0,1] and ")
+					TEXT("would read as unsigned everywhere until a consumer applied the recorded decode. ")
+					TEXT("Set OutputFormat to RGBA16F, or clear bBipolarOutput and do the [-1,1] conversion ")
+					TEXT("at the sample site."),
+					ChannelNames[Index]);
+				return false;
+			}
+		}
+	}
+
 	if (bBakeBrickBounds)
 	{
 		if (BrickSize < 2 || !FMath::IsPowerOfTwo(BrickSize) || Resolution % BrickSize != 0)
@@ -44,6 +78,39 @@ bool UNoiseBakeRecipe::Validate(FString& OutError) const
 				TEXT("BrickSize %d must be a power of two that divides Resolution %d."),
 				BrickSize, Resolution);
 			return false;
+		}
+	}
+
+	// Group members must agree on normalize mode. Mixing modes within a group
+	// produces one shared range that is then interpreted two different ways,
+	// which defeats the point of grouping.
+	for (int32 Group = 1; Group <= 3; ++Group)
+	{
+		ENoiseNormalizeMode GroupMode = ENoiseNormalizeMode::None;
+		int32 FirstMember = INDEX_NONE;
+
+		for (int32 Index = 0; Index < 4; ++Index)
+		{
+			if (Channels[Index].NormalizationGroup != Group)
+			{
+				continue;
+			}
+
+			if (FirstMember == INDEX_NONE)
+			{
+				FirstMember = Index;
+				GroupMode = Channels[Index].NormalizeMode;
+				continue;
+			}
+
+			if (Channels[Index].NormalizeMode != GroupMode)
+			{
+				OutError = FString::Printf(
+					TEXT("Normalization group %d mixes normalize modes (channel %s differs from %s). ")
+					TEXT("Members of a group share one range, so they must agree on how to interpret it."),
+					Group, ChannelNames[Index], ChannelNames[FirstMember]);
+				return false;
+			}
 		}
 	}
 

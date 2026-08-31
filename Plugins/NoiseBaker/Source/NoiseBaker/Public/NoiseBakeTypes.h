@@ -145,7 +145,24 @@ namespace NoiseBakeConstants
 	static constexpr int32 EqualizationLutSize = 64;
 }
 
-/** How a channel's raw FBM output gets mapped into [0,1] before quantization. */
+/** How a channel's raw FBM output gets mapped into [0,1].
+ *
+ *  Note there is no "symmetric about zero" mode, and there deliberately is not
+ *  one yet. Symmetric normalization is a property of the SOURCE, not the
+ *  destination: it matters when a basis emits genuinely signed values, so that
+ *  raw zero and output zero coincide. Every basis here returns [0,1], so raw
+ *  zero is the bottom of the range rather than a meaningful centre, and
+ *  normalizing symmetrically against it would leave the data occupying part of
+ *  the range and waste the rest.
+ *
+ *  Bipolar output does not need it. The polarity conversion is the last step,
+ *  so a channel normalized to the full [0,1] and then remapped to [-1,1] puts
+ *  its zero crossing at the midpoint of the observed range, using every level.
+ *  Pair it with CenterMedian and the crossing lands on the median instead,
+ *  which is what a displacement field with no net drift actually wants.
+ *
+ *  When a signed basis arrives -- curl of a vector potential -- a symmetric mode
+ *  comes back, scoped to that basis rather than to the output polarity. */
 UENUM(BlueprintType)
 enum class ENoiseNormalizeMode : uint8
 {
@@ -153,16 +170,6 @@ enum class ENoiseNormalizeMode : uint8
 	 *  slightly, and use that. Correct in almost every case and costs ~1% of the
 	 *  bake. This is what you want unless you have a reason otherwise. */
 	AutoProbe = 0	UMETA(DisplayName = "Auto (Probe Pass)"),
-
-	/** Probe, then normalize about zero using a single magnitude
-	 *  M = max(|min|, |max|), giving the range [-M, M].
-	 *
-	 *  Required for any channel whose sign is meaningful. Plain AutoProbe maps
-	 *  the observed min to 0 and max to 1, which moves the zero crossing to
-	 *  wherever the probe happened to land. For a vector component that is not a
-	 *  cosmetic difference: it introduces a constant offset, so a field that
-	 *  should integrate to zero net displacement acquires a drift. */
-	AutoProbeSymmetric = 3	UMETA(DisplayName = "Auto (Symmetric About Zero)"),
 
 	/** Use ManualMin/ManualMax. Use this when two channels must share an
 	 *  identical range, or when you are re-baking at a new resolution and need
@@ -280,8 +287,8 @@ struct NOISEBAKER_API FNoiseChannelRecipe
 	 *  preview says the directions are wrong.
 	 *
 	 *  For a curl or warp field, put R, G and B in group 1 and leave A at 0.
-	 *  Group members should also share a normalize mode; mixing Symmetric and
-	 *  AutoProbe within a group defeats the purpose. */
+	 *  Group members should also share a normalize mode; one shared range
+	 *  interpreted two different ways defeats the purpose. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Normalization", meta = (ClampMin = "0", ClampMax = "3"))
 	int32 NormalizationGroup = 0;
 
@@ -291,7 +298,11 @@ struct NOISEBAKER_API FNoiseChannelRecipe
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Normalization", meta = (EditCondition = "NormalizeMode == ENoiseNormalizeMode::Manual", EditConditionHides))
 	float ManualMax = 1.0f;
 
-	/** BasePeriod as a plain integer. */
+	/** BasePeriod as a plain integer.
+	 *
+	 *  The clamp is what makes the mandatory Invalid = 0 enumerator harmless: a
+	 *  default-initialized struct falls through to period 1 rather than zero,
+	 *  which would divide by zero in the lattice mapping. */
 	int32 GetBasePeriod() const
 	{
 		return FMath::Max((int32)BasePeriod, 1);

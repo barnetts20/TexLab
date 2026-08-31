@@ -319,11 +319,7 @@ bool FNoiseVolumeBaker::RunProbePass(
 	OutNormalization.SetNum(4);
 
 	const bool bNeedsProbe = Channels.ContainsByPredicate(
-		[](const FNoiseChannelRecipe& C)
-		{
-			return C.NormalizeMode == ENoiseNormalizeMode::AutoProbe
-				|| C.NormalizeMode == ENoiseNormalizeMode::AutoProbeSymmetric;
-		});
+		[](const FNoiseChannelRecipe& C) { return C.NormalizeMode == ENoiseNormalizeMode::AutoProbe; });
 
 	float ObservedMin[4] = { TNumericLimits<float>::Max(), TNumericLimits<float>::Max(), TNumericLimits<float>::Max(), TNumericLimits<float>::Max() };
 	float ObservedMax[4] = { TNumericLimits<float>::Lowest(), TNumericLimits<float>::Lowest(), TNumericLimits<float>::Lowest(), TNumericLimits<float>::Lowest() };
@@ -418,7 +414,6 @@ bool FNoiseVolumeBaker::RunProbePass(
 		switch (C.NormalizeMode)
 		{
 		case ENoiseNormalizeMode::AutoProbe:
-		case ENoiseNormalizeMode::AutoProbeSymmetric:
 		{
 			RangeMin = ObservedMin[Index];
 			RangeMax = ObservedMax[Index];
@@ -438,18 +433,6 @@ bool FNoiseVolumeBaker::RunProbePass(
 			const float Padding = Span * NoiseBakeInternal::ProbePadding;
 			RangeMin -= Padding;
 			RangeMax += Padding;
-
-			if (C.NormalizeMode == ENoiseNormalizeMode::AutoProbeSymmetric)
-			{
-				// One magnitude either side of zero. Plain AutoProbe would map
-				// the observed minimum to 0, which moves the zero crossing to
-				// wherever the probe happened to land. For a vector component
-				// that is a constant offset, so a field that should integrate to
-				// zero net displacement acquires a drift.
-				const float Magnitude = FMath::Max(FMath::Abs(RangeMin), FMath::Abs(RangeMax));
-				RangeMin = -Magnitude;
-				RangeMax = Magnitude;
-			}
 			break;
 		}
 
@@ -471,9 +454,10 @@ bool FNoiseVolumeBaker::RunProbePass(
 		// Storage encoding. A signed channel written to an unsigned format is
 		// bias-encoded from [-1,1] into [0,1]; everything else is identity.
 		//
-		// Note this is derived from the channel's OUTPUT RANGE rather than from
-		// its normalization, and the two are independent: a channel can be
-		// normalized symmetrically and still be remapped into [0,1] for output.
+		// Recipe validation now rejects bipolar output on BGRA8, so this branch
+		// is unreachable in practice. It stays because the decode contract has
+		// to hold for any (format, polarity) pair a consumer might encounter,
+		// including textures baked before that rule existed.
 		float EncodeScale = 1.0f;
 		float EncodeBias = 0.0f;
 

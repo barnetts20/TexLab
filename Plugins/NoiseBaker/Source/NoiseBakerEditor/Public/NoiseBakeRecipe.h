@@ -63,22 +63,28 @@ public:
 
 	// -- Channels -----------------------------------------------------------
 	//
-	// ShowOnlyInnerProperties splices each struct's members directly into its
-	// category, dropping the struct property's own header row. Without it the
-	// panel nests three deep -- Channels > R > Red Channel > properties -- and
-	// the middle row carries no information the category name does not already
-	// give you.
+	// One flat category with four struct rows, rather than a "Channels|R"
+	// subcategory per channel. The subcategory was the extra level: it creates a
+	// category AND a subcategory, and the struct property then adds its own
+	// expander on top, so the panel nested three deep before reaching a
+	// parameter. ShowOnlyInnerProperties removes the struct's expander but not
+	// the two category levels, which is why it did not help here.
+	//
+	// Note that ShowOnlyInnerProperties must NOT come back now. With all four
+	// channels in one category it would splice all four structs' members into a
+	// single undifferentiated list with no indication of which channel any given
+	// Seed or Basis belongs to.
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Channels|R", meta = (ShowOnlyInnerProperties))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Channels", meta = (DisplayName = "R"))
 	FNoiseChannelRecipe RedChannel;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Channels|G", meta = (ShowOnlyInnerProperties))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Channels", meta = (DisplayName = "G"))
 	FNoiseChannelRecipe GreenChannel;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Channels|B", meta = (ShowOnlyInnerProperties))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Channels", meta = (DisplayName = "B"))
 	FNoiseChannelRecipe BlueChannel;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Channels|A", meta = (ShowOnlyInnerProperties))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Channels", meta = (DisplayName = "A"))
 	FNoiseChannelRecipe AlphaChannel;
 
 	// -- Acceleration -------------------------------------------------------
