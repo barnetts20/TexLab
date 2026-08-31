@@ -177,17 +177,50 @@ float PN_Perlin(float3 P, int3 Period, uint Seed)
 
 /** Cellular noise. Returns (F1, F2) as raw distances in cell units.
  *
+ *  Smoothness selects between two forms of F1.
+ *
+ *  At 0 this is strict min, which is C0 but NOT C1: the derivative jumps
+ *  wherever the nearest feature point switches, which is exactly on the cell
+ *  boundaries. That is invisible in a density field and ruinous in a derivative
+ *  one, because a discontinuity in dP/dx becomes a discontinuity in the OUTPUT
+ *  value of a curl or gradient bake. It shows up as hard cell walls.
+ *
+ *  Above 0 it is an exponential soft-min:
+ *
+ *      F1 = -log( sum exp(-k * d_i) ) / k
+ *
+ *  which converges to true min as k rises and to the mean as k falls. There is
+ *  no switching anywhere, so no argmin to be discontinuous: every neighbour
+ *  contributes always and the weights vary smoothly with distance. The
+ *  discontinuity is not reduced, it stops existing.
+ *
+ *  Order-independent, unlike iterating a pairwise polynomial smin over 27
+ *  candidates, and it costs nothing extra: the 27 distances are already being
+ *  computed, so min-tracking is simply replaced by an accumulate.
+ *
+ *  F2 is unaffected. A smooth analogue of "second nearest" needs an actual
+ *  ranking and gets messy, so F2 stays strict, which is why F2-F1 remains a
+ *  density-only basis.
+ *
  *  The wrap applies to the hash lookup only: the feature point's POSITION uses
  *  the unwrapped neighbour offset, so distances stay continuous across the tile
  *  boundary, while its identity comes from the wrapped cell so the cell on the
  *  far side of the seam is the same cell. */
-float2 PN_Worley(float3 P, int3 Period, uint Seed, float Jitter)
+float2 PN_Worley(float3 P, int3 Period, uint Seed, float Jitter, float Smoothness)
 {
     const int3 C = (int3) floor(P);
     const float3 F = P - (float3) C;
 
+    const bool bSoft = (Smoothness > 0.0f);
+
+	// Sharpness. Smoothness runs 0..1 for the author; k is what the exponential
+	// actually wants, and the useful band is roughly 4 to 32. Inverted so that
+	// larger Smoothness means a softer field.
+    const float K = lerp(32.0f, 4.0f, saturate(Smoothness));
+
     float F1 = 1e9f;
     float F2 = 1e9f;
+    float SoftSum = 0.0f;
 
     const float JitterBias = (1.0f - Jitter) * 0.5f;
 
@@ -215,15 +248,26 @@ float2 PN_Worley(float3 P, int3 Period, uint Seed, float Jitter)
                 {
                     F2 = D;
                 }
+
+                SoftSum += exp(-K * D);
             }
         }
+    }
+
+    if (bSoft)
+    {
+		// The far neighbours underflow to zero at high K, which is harmless as
+		// long as at least one term survives. Guarded rather than trusted,
+		// because log(0) would produce an infinity that then propagates through
+		// the whole octave sum.
+        F1 = -log(max(SoftSum, 1e-20f)) / K;
     }
 
     return float2(F1, F2);
 }
 
 /** Dispatch to a basis by enum, normalised to [0,1]. */
-float PN_SampleBasis(int Basis, float3 P, int3 Period, uint Seed, float Jitter)
+float PN_SampleBasis(int Basis, float3 P, int3 Period, uint Seed, float Jitter, float Smoothness)
 {
     if (Basis == PN_BASIS_VALUE)
     {
@@ -237,13 +281,15 @@ float PN_SampleBasis(int Basis, float3 P, int3 Period, uint Seed, float Jitter)
 
     if (Basis == PN_BASIS_WORLEY_F1)
     {
-        const float2 W = PN_Worley(P, Period, Seed, Jitter);
+        const float2 W = PN_Worley(P, Period, Seed, Jitter, Smoothness);
         return saturate(1.0f - W.x); // 1 at the feature point
     }
 
     if (Basis == PN_BASIS_WORLEY_F2F1)
     {
-        const float2 W = PN_Worley(P, Period, Seed, Jitter);
+		// Smoothness is passed but only affects F1, and F2-F1 needs both. The
+		// difference stays C0-only, so this basis is not a good potential.
+        const float2 W = PN_Worley(P, Period, Seed, Jitter, Smoothness);
         return saturate(W.y - W.x); // cell-boundary web
     }
 
@@ -252,7 +298,7 @@ float PN_SampleBasis(int Basis, float3 P, int3 Period, uint Seed, float Jitter)
 		// The standard cloud base: Perlin remapped so that Worley's low end
 		// erodes it. Offsetting the Worley seed keeps the two decorrelated.
         const float Pl = saturate(PN_Perlin(P, Period, Seed) * 0.5f + 0.5f);
-        const float2 W = PN_Worley(P, Period, Seed + 0x9E3779B9u, Jitter);
+        const float2 W = PN_Worley(P, Period, Seed + 0x9E3779B9u, Jitter, Smoothness);
         const float Wo = saturate(1.0f - W.x);
 
         return saturate(PN_Remap(Pl, Wo - 1.0f, 1.0f, 0.0f, 1.0f));
@@ -283,6 +329,7 @@ float PN_FBM(
 	float Gain,
 	uint Seed,
 	float Jitter,
+	float Smoothness,
 	bool bRidged)
 {
     float Sum = 0.0f;
@@ -301,7 +348,7 @@ float PN_FBM(
 		// octave index keeps low-index octaves from sharing hash neighbourhoods.
         const uint OctaveSeed = Seed + (uint) i * 0x9E3779B9u;
 
-        float V = PN_SampleBasis(Basis, P, Period3, OctaveSeed, Jitter);
+        float V = PN_SampleBasis(Basis, P, Period3, OctaveSeed, Jitter, Smoothness);
 
         if (bRidged)
         {

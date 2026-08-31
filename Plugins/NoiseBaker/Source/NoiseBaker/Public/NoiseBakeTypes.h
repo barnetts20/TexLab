@@ -296,6 +296,30 @@ struct NOISEBAKER_API FNoiseChannelRecipe
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Basis", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float WorleyJitter = 1.0f;
 
+	/** Replaces Worley's strict nearest-point minimum with a weighted blend of
+	 *  all 27 candidates. Worley bases only; 0 is the classic behaviour.
+	 *
+	 *  Strict min is C0 but not C1: the derivative jumps wherever the nearest
+	 *  feature point switches, which is exactly on the cell boundaries. In a
+	 *  density field that is invisible. In a DERIVATIVE field it is ruinous,
+	 *  because a discontinuity in the potential's slope becomes a discontinuity
+	 *  in the output value of a curl or gradient bake, and it reads as hard cell
+	 *  walls.
+	 *
+	 *  The soft form has no argmin to be discontinuous: every neighbour
+	 *  contributes always, with weights that vary smoothly with distance. It is
+	 *  free, since the 27 distances are already computed either way.
+	 *
+	 *  This is a character control, not a fix to leave at maximum. Raising it
+	 *  rounds cells toward blobs, and far enough up the field starts to resemble
+	 *  Value noise, at which point Perlin is cheaper. 0.3 to 0.6 is the useful
+	 *  band for a potential.
+	 *
+	 *  Only F1 is affected. F2 needs an actual ranking, so F2-F1 stays C0-only
+	 *  and remains a density-only basis. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Basis", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float WorleySmoothness = 0.0f;
+
 	/** Fold each octave around its midpoint before summing, producing sharp
 	 *  creases instead of smooth undulation.
 	 *

@@ -37,9 +37,16 @@
 #define NVP_OUTPUT_STEP_HEAT       2
 #define NVP_OUTPUT_COMPOSITE       3
 #define NVP_OUTPUT_TRANSMITTANCE   4
+#define NVP_OUTPUT_WARP_VECTOR     5
 
-float NVP_Max3(float3 V) { return max(V.x, max(V.y, V.z)); }
-float NVP_Min3(float3 V) { return min(V.x, min(V.y, V.z)); }
+float NVP_Max3(float3 V)
+{
+    return max(V.x, max(V.y, V.z));
+}
+float NVP_Min3(float3 V)
+{
+    return min(V.x, min(V.y, V.z));
+}
 
 /** Reciprocal that survives an axis-aligned ray.
  *
@@ -61,6 +68,38 @@ float4 NVP_PowSafe(float4 Base, float4 Exponent)
     return pow(max(Base, 1e-6), Exponent);
 }
 
+/** Voxels along the longest axis, queried from the resource unless overridden.
+ *
+ *  Deriving this rather than authoring it matters because the value feeds the
+ *  step floor, and a hand-entered number silently goes stale the moment the
+ *  recipe is re-baked at a different resolution. A floor that is too coarse
+ *  loses detail the texture does contain; too fine and the march burns steps
+ *  resolving detail that is not there. Neither failure announces itself.
+ *
+ *  GetDimensions reports the RESIDENT resource, so a streamed texture could
+ *  report a partial mip 0. The baker sets NeverStream on everything it writes,
+ *  which is what makes this trustworthy. Pass a positive InOverride if you are
+ *  pointing this at a volume from somewhere else that may stream.
+ *
+ *  The longest axis is the right choice for a non-cubic volume: it has the
+ *  smallest voxels, and the floor has to respect the finest detail present.
+ *
+ *  This is a resource query, not a constant. It is uniform across the draw so
+ *  it normally hoists out of the loop, which is why it is called once up front
+ *  rather than per step. */
+float NVP_ResolveVoxelsPerAxis(Texture3D InTex, float InOverride)
+{
+    if (InOverride > 0.0)
+    {
+        return InOverride;
+    }
+
+    uint Width, Height, Depth;
+    InTex.GetDimensions(Width, Height, Depth);
+
+    return (float) max(Width, max(Height, Depth));
+}
+
 /** Local box position in [-1,1] to texture UVW.
  *
  *  TileCount is the whole point of this function. At 1 you see a single copy of
@@ -74,45 +113,68 @@ float3 NVP_BoxToUVW(float3 LocalPos, float3 TileCount, float3 DomainOffset)
     return (LocalPos * 0.5 + 0.5) * TileCount + DomainOffset;
 }
 
-/** Marches the unit box and accumulates all four channels independently.
+/** Marches the unit box and accumulates all four channels independently, with
+ *  an optional domain warp from a second volume.
  *
- *  InViewVec    Local camera vector, surface toward camera. Same convention as
- *               the galaxy marcher: CameraVector through TransformVector
- *               [World -> Local]. Direction only; normalization is irrelevant.
+ *  This is the shared implementation. Call NoiseVolumeMarch or
+ *  NoiseVolumeMarchWarped rather than this directly; they exist so the unwarped
+ *  case does not have to supply warp arguments it will not use.
  *
- *  InCamPosN    Camera position in the box's normalized space, the box spanning
- *               -1 to 1. This is the ray ORIGIN, not a distance reference, so a
- *               wrong value moves the ray rather than merely biasing step size.
+ *  InViewVec    Local camera vector, surface toward camera. CameraVector through
+ *               TransformVector [World -> Local].
  *
- *  InTileCount  Copies of the volume across the box, per axis. Non-uniform
- *               values are legal and occasionally useful for isolating which
- *               axis a seam is on.
+ *  InCamPosN    Camera position in the box's normalized space, spanning -1 to 1.
+ *               This is the ray ORIGIN, so a wrong value moves the ray rather
+ *               than merely biasing step size.
  *
+ *  InTileCount  Copies of the volume across the box, per axis.
  *  InDomainOffset  Added to UVW after tiling. Drive from Time for a scroll.
+ *
+ *  InWarpTileCount / InWarpDomainOffset
+ *               The same two controls for the warp volume, kept separate so the
+ *               warp can run at a different scale from the field it displaces.
+ *               Note that doing so changes the composite period to the LCM of
+ *               the two: each field still tiles, but the pair no longer repeats
+ *               once per box.
+ *
+ *  InWarpAmplitude  Displacement in UVW units of the MAIN field's tile space.
+ *               Zero skips the warp fetch entirely. A useful anchor: 1/BasePeriod
+ *               of the field being displaced moves it by about one lattice cell,
+ *               and beyond roughly half a cell the warp folds the domain onto
+ *               itself, which reads as smearing rather than distortion.
+ *
+ *  InWarpDecodeScale / InWarpDecodeBias
+ *               Applied to the warp sample before use: Value = S * Scale + Bias.
+ *               (1, 0) for an RGBA16F vector field, which stores signed values
+ *               directly. (2, -1) to press an unsigned packed texture into
+ *               service as a warp, which is a legitimate thing to try.
  *
  *  InDensityScale  Per-channel extinction multiplier. Zero hides a channel.
  *  InPower         Per-channel shaping exponent. 1 is off.
  *
- *  InStepBudget    See the note below; this is a budget, not a count.
+ *  InStepBudget    A budget, not a count; see the note in the loop.
  *  InStepGrowth    Step growth across the marched span.
  *  InMaxSteps      Safety bound. Set to int(StepBudget) + 8.
  *  InJitter        Per-pixel value in (0,1] scaling the FIRST step only.
- *  InVoxelsPerAxis Resolution of the baked volume, used to derive the step
- *                  floor. Passing 0 disables the floor.
+ *  InVoxelsPerAxis Resolution override for the step floor. Pass 0 to query it
+ *                  from the texture resource, which is what you want.
  *
- *  Returns per-channel accumulated emission in RGBA. OutSteps and
- *  OutTransmittance come back through the Custom node's Additional Outputs. */
-float4 NoiseVolumeMarch(
+ *  Returns per-channel accumulated emission in RGBA. */
+float4 NoiseVolumeMarchInternal(
     Texture3D InTex, SamplerState InSampler,
+    Texture3D InWarpTex, SamplerState InWarpSampler,
     float3 InViewVec, float3 InCamPosN,
     float3 InTileCount, float3 InDomainOffset,
+    float3 InWarpTileCount, float3 InWarpDomainOffset,
+    float InWarpAmplitude, float InWarpDecodeScale, float InWarpDecodeBias,
     float4 InDensityScale, float4 InPower,
     float InStepBudget, float InStepGrowth, int InMaxSteps,
     float InJitter, float InVoxelsPerAxis,
-    out float OutSteps, out float4 OutTransmittance)
+    out float OutSteps, out float4 OutTransmittance, out float3 OutFirstWarp)
 {
     OutSteps = 0.0;
     OutTransmittance = 1.0;
+    OutFirstWarp = 0.0;
 
     float3 o = InCamPosN;
     float3 dir = normalize(-InViewVec);
@@ -121,13 +183,13 @@ float4 NoiseVolumeMarch(
 
     float3 InvDir = NVP_SafeRcp(dir);
     float3 T0 = (float3(-1.0, -1.0, -1.0) - o) * InvDir;
-    float3 T1 = (float3( 1.0,  1.0,  1.0) - o) * InvDir;
+    float3 T1 = (float3(1.0, 1.0, 1.0) - o) * InvDir;
 
     float3 TNear = min(T0, T1);
-    float3 TFar  = max(T0, T1);
+    float3 TFar = max(T0, T1);
 
     float tEnter = NVP_Max3(TNear);
-    float tExit  = NVP_Min3(TFar);
+    float tExit = NVP_Min3(TFar);
 
     // Behind the camera. Real case, not an impossible one: the preview proxy is
     // drawn with inverted normals so its far face can rasterize while the box
@@ -161,9 +223,10 @@ float4 NoiseVolumeMarch(
     // the Nyquist limit: stepping finer resolves detail the texture does not
     // contain. A floor can only lengthen a step, so this is pure saving, and it
     // binds exactly when the budget was set too fine.
+    float VoxelsPerAxis = NVP_ResolveVoxelsPerAxis(InTex, InVoxelsPerAxis);
     float MaxTiles = NVP_Max3(max(InTileCount, 1e-3));
-    float voxelStep = (InVoxelsPerAxis > 0.0)
-        ? (2.0 / (MaxTiles * InVoxelsPerAxis)) * 0.5
+    float voxelStep = (VoxelsPerAxis > 0.0)
+        ? (2.0 / (MaxTiles * VoxelsPerAxis)) * 0.5
         : 0.0;
     float minStep = max(voxelStep, 1e-5);
 
@@ -223,6 +286,35 @@ float4 NoiseVolumeMarch(
         float3 LocalPos = o + dir * (t + stepLen * 0.5);
         float3 UVW = NVP_BoxToUVW(LocalPos, InTileCount, InDomainOffset);
 
+        // Domain warp.
+        //
+        // The offset is applied to the SAMPLE POSITION, not to the ray, so the
+        // march geometry and the step schedule are untouched: this displaces
+        // what the field looks like, not where the ray goes.
+        //
+        // Sampled at the unwarped position, so the two fields share a frame. To
+        // chain warps -- large-scale gradient carrying small-scale curl along
+        // with it -- you would sample the second warp at the already-warped
+        // position instead, which costs a dependent fetch. Worth knowing that
+        // the two are not the same operation and do not commute.
+        //
+        // Tiling: warping breaks the box's single-tile periodicity unless the
+        // warp shares the field's period. Each field still tiles on its own, but
+        // the composite repeats on the LCM of the two.
+        if (InWarpAmplitude != 0.0)
+        {
+            float3 WarpUVW = NVP_BoxToUVW(LocalPos, InWarpTileCount, InWarpDomainOffset);
+            float3 Warp = InWarpTex.SampleLevel(InWarpSampler, WarpUVW, 0).rgb;
+
+            Warp = Warp * InWarpDecodeScale + InWarpDecodeBias;
+            UVW += Warp * InWarpAmplitude;
+
+            if (i == 0)
+            {
+                OutFirstWarp = Warp;
+            }
+        }
+
         // SampleLevel, not Sample. See the header note.
         float4 Density = InTex.SampleLevel(InSampler, UVW, 0);
 
@@ -255,6 +347,110 @@ float4 NoiseVolumeMarch(
     return Emission;
 }
 
+/** Unwarped march. Passes the main texture as its own warp source with zero
+ *  amplitude, which the loop branches past, so no extra fetch happens. */
+float4 NoiseVolumeMarch(
+    Texture3D InTex, SamplerState InSampler,
+    float3 InViewVec, float3 InCamPosN,
+    float3 InTileCount, float3 InDomainOffset,
+    float4 InDensityScale, float4 InPower,
+    float InStepBudget, float InStepGrowth, int InMaxSteps,
+    float InJitter, float InVoxelsPerAxis,
+    out float OutSteps, out float4 OutTransmittance)
+{
+    float3 UnusedWarp = 0.0;
+
+    return NoiseVolumeMarchInternal(
+        InTex, InSampler,
+        InTex, InSampler,
+        InViewVec, InCamPosN,
+        InTileCount, InDomainOffset,
+        InTileCount, InDomainOffset,
+        0.0, 1.0, 0.0,
+        InDensityScale, InPower,
+        InStepBudget, InStepGrowth, InMaxSteps,
+        InJitter, InVoxelsPerAxis,
+        OutSteps, OutTransmittance, UnusedWarp);
+}
+
+/** Warped march. Displaces the sample position of the main volume by the RGB of
+ *  a second volume, typically a vector field bake. */
+float4 NoiseVolumeMarchWarped(
+    Texture3D InTex, SamplerState InSampler,
+    Texture3D InWarpTex, SamplerState InWarpSampler,
+    float3 InViewVec, float3 InCamPosN,
+    float3 InTileCount, float3 InDomainOffset,
+    float3 InWarpTileCount, float3 InWarpDomainOffset,
+    float InWarpAmplitude, float InWarpDecodeScale, float InWarpDecodeBias,
+    float4 InDensityScale, float4 InPower,
+    float InStepBudget, float InStepGrowth, int InMaxSteps,
+    float InJitter, float InVoxelsPerAxis,
+    out float OutSteps, out float4 OutTransmittance, out float3 OutFirstWarp)
+{
+    return NoiseVolumeMarchInternal(
+        InTex, InSampler,
+        InWarpTex, InWarpSampler,
+        InViewVec, InCamPosN,
+        InTileCount, InDomainOffset,
+        InWarpTileCount, InWarpDomainOffset,
+        InWarpAmplitude, InWarpDecodeScale, InWarpDecodeBias,
+        InDensityScale, InPower,
+        InStepBudget, InStepGrowth, InMaxSteps,
+        InJitter, InVoxelsPerAxis,
+        OutSteps, OutTransmittance, OutFirstWarp);
+}
+
+/** Shared output selection for both preview wrappers. */
+float4 NVP_SelectOutput(
+    float4 Emission, float Steps, float4 Transmittance, float3 FirstWarp,
+    int InOutputMode, int InChannelSelect, int InMaxSteps)
+{
+    // Coverage of the least transmissive channel, used as alpha in the modes
+    // that need one.
+    float Coverage = 1.0 - NVP_Min3(Transmittance.rgb);
+    Coverage = max(Coverage, 1.0 - Transmittance.a);
+
+    if (InOutputMode == NVP_OUTPUT_SINGLE_CHANNEL)
+    {
+        float V = Emission[clamp(InChannelSelect, 0, 3)];
+        return float4(V, V, V, Coverage);
+    }
+
+    if (InOutputMode == NVP_OUTPUT_STEP_HEAT)
+    {
+        // Raw count normalized only by the bound, so the ramp means something
+        // absolute. Blue below budget, red at it: anything saturating red is
+        // hitting the safety bound and truncating.
+        float H = saturate(Steps / max((float) InMaxSteps, 1.0));
+        return float4(H, 1.0 - abs(H * 2.0 - 1.0), 1.0 - H, 1.0);
+    }
+
+    if (InOutputMode == NVP_OUTPUT_COMPOSITE)
+    {
+        float V = dot(Emission, float4(0.25, 0.25, 0.25, 0.25));
+        return float4(V, V, V, Coverage);
+    }
+
+    if (InOutputMode == NVP_OUTPUT_TRANSMITTANCE)
+    {
+        return Transmittance;
+    }
+
+    if (InOutputMode == NVP_OUTPUT_WARP_VECTOR)
+    {
+        // The decoded warp vector at the first sample along the ray, remapped
+        // for display. This is a direction readout on the entry surface of the
+        // box, not an integral: a raymarch of a vector field has no meaningful
+        // accumulation, so integrating one would show nothing useful.
+        //
+        // Grey is zero. Red-ward means +X, green +Y, blue +Z.
+        return float4(FirstWarp * 0.5 + 0.5, 1.0);
+    }
+
+    // NVP_OUTPUT_CHANNELS_RGBA. The four accumulations, untouched.
+    return Emission;
+}
+
 /** Single-output wrapper for a Custom node without Additional Outputs wired.
  *
  *  InOutputMode selects what lands in the return value; see the NVP_OUTPUT_*
@@ -280,37 +476,42 @@ float4 NoiseVolumePreview(
         InJitter, InVoxelsPerAxis,
         Steps, Transmittance);
 
-    // Coverage of the least transmissive channel, used as alpha in the modes
-    // that need one.
-    float Coverage = 1.0 - NVP_Min3(Transmittance.rgb);
-    Coverage = max(Coverage, 1.0 - Transmittance.a);
+    return NVP_SelectOutput(Emission, Steps, Transmittance, 0.0,
+        InOutputMode, InChannelSelect, InMaxSteps);
+}
 
-    if (InOutputMode == NVP_OUTPUT_SINGLE_CHANNEL)
-    {
-        float V = Emission[clamp(InChannelSelect, 0, 3)];
-        return float4(V, V, V, Coverage);
-    }
+/** Warped preview. Same as NoiseVolumePreview with a second volume displacing
+ *  the sample position, plus output mode 5 for reading the warp direction.
+ *
+ *  Set InWarpAmplitude to 0 for a clean A/B against the unwarped field: the
+ *  branch skips the fetch, so it is the same march either way. */
+float4 NoiseVolumePreviewWarped(
+    Texture3D InTex, SamplerState InSampler,
+    Texture3D InWarpTex, SamplerState InWarpSampler,
+    float3 InViewVec, float3 InCamPosN,
+    float3 InTileCount, float3 InDomainOffset,
+    float3 InWarpTileCount, float3 InWarpDomainOffset,
+    float InWarpAmplitude, float InWarpDecodeScale, float InWarpDecodeBias,
+    float4 InDensityScale, float4 InPower,
+    float InStepBudget, float InStepGrowth, int InMaxSteps,
+    float InJitter, float InVoxelsPerAxis,
+    int InOutputMode, int InChannelSelect)
+{
+    float Steps = 0.0;
+    float4 Transmittance = 1.0;
+    float3 FirstWarp = 0.0;
 
-    if (InOutputMode == NVP_OUTPUT_STEP_HEAT)
-    {
-        // Raw count normalized only by the bound, so the ramp means something
-        // absolute. Blue below budget, red at it: anything saturating red is
-        // hitting the safety bound and truncating.
-        float H = saturate(Steps / max((float)InMaxSteps, 1.0));
-        return float4(H, 1.0 - abs(H * 2.0 - 1.0), 1.0 - H, 1.0);
-    }
+    float4 Emission = NoiseVolumeMarchWarped(
+        InTex, InSampler, InWarpTex, InWarpSampler,
+        InViewVec, InCamPosN,
+        InTileCount, InDomainOffset,
+        InWarpTileCount, InWarpDomainOffset,
+        InWarpAmplitude, InWarpDecodeScale, InWarpDecodeBias,
+        InDensityScale, InPower,
+        InStepBudget, InStepGrowth, InMaxSteps,
+        InJitter, InVoxelsPerAxis,
+        Steps, Transmittance, FirstWarp);
 
-    if (InOutputMode == NVP_OUTPUT_COMPOSITE)
-    {
-        float V = dot(Emission, float4(0.25, 0.25, 0.25, 0.25));
-        return float4(V, V, V, Coverage);
-    }
-
-    if (InOutputMode == NVP_OUTPUT_TRANSMITTANCE)
-    {
-        return Transmittance;
-    }
-
-    // NVP_OUTPUT_CHANNELS_RGBA. The four accumulations, untouched.
-    return Emission;
+    return NVP_SelectOutput(Emission, Steps, Transmittance, FirstWarp,
+        InOutputMode, InChannelSelect, InMaxSteps);
 }

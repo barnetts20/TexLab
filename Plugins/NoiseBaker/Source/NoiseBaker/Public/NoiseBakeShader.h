@@ -32,7 +32,7 @@ public:
 		SHADER_PARAMETER(float, CurlEpsilon)
 		SHADER_PARAMETER(FVector3f, DomainOffset)
 
-		/** x: Gain, y: WorleyJitter, z/w: unused */
+		/** x: Gain, y: WorleyJitter, z: WorleySmoothness, w: unused */
 		SHADER_PARAMETER_ARRAY(FVector4f, ChannelParamsA, [4])
 
 		/** x: Basis, y: BasePeriod, z: Octaves, w: Lacunarity */

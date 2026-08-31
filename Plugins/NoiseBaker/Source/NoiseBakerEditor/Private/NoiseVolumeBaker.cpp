@@ -103,7 +103,7 @@ void FNoiseVolumeBaker::BuildDispatchParams(const UNoiseBakeRecipeBase& Recipe, 
 	{
 		const FNoiseChannelRecipe& C = Channels[Index];
 
-		OutParams.ChannelParamsA[Index] = FVector4f(C.Gain, C.WorleyJitter, 0.0f, 0.0f);
+		OutParams.ChannelParamsA[Index] = FVector4f(C.Gain, C.WorleyJitter, C.WorleySmoothness, 0.0f);
 
 		OutParams.ChannelParamsB[Index] = FIntVector4(
 			(int32)C.Basis,

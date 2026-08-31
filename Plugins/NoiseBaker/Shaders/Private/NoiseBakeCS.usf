@@ -40,7 +40,7 @@ float CurlEpsilon;
  *  period exactly 1.0 in UVW, the two must agree. */
 float3 DomainOffset;
 
-// Gain, WorleyJitter, unused, unused
+// Gain, WorleyJitter, WorleySmoothness, unused
 float4 ChannelParamsA[4];
 
 // Basis, BasePeriod, Octaves, Lacunarity
@@ -79,6 +79,7 @@ float EvalChannelRaw(int ChannelIndex, float3 UVW)
 		/* Gain       */ A.x,
 		/* Seed       */ (uint) C.x,
 		/* Jitter     */ A.y,
+		/* Smoothness */ A.z,
 		/* bRidged    */ bRidged);
 }
 
