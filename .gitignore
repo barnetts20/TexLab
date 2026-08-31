@@ -32,6 +32,7 @@ Saved/
 Build/
 # Baked output. Regenerate from the recipes in Content/NoiseRecipes.
 Content/Noise/
+Plugins/VolumeNoiseLib/Content
 
 # ---------------------------------------------------------------------------
 #  Generated project files
