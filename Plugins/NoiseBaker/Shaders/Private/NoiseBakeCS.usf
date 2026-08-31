@@ -10,79 +10,168 @@
 #include "/Engine/Public/Platform.ush"
 #include "/Plugin/NoiseBaker/Private/PeriodicNoise.ush"
 
-int3	VolumeResolution;
-int		SliceOffset;
-int		SliceCount;
-int		Supersample;
-int		bApplyNormalize;
+int3 VolumeResolution;
+int SliceOffset;
+int SliceCount;
+int Supersample;
+/** Which stages of the shaping chain to run. The two probe passes need
+ *  different amounts of it, and a boolean could not express three cases.
+ *
+ *    0 Raw          Straight FBM output. The range probe measures this.
+ *    1 Normalized   Normalization only, in [0,1]. The distribution probe
+ *                   measures this, because redistribution operates on the
+ *                   normalized value and a histogram of raw values would have
+ *                   to be re-binned afterwards, losing precision exactly where
+ *                   the median sits.
+ *    2 Full         Everything: normalize, redistribute, remap, invert,
+ *                   polarity, storage encode.
+ */
+int ShapeStage;
 
 /** Constant offset added to UVW before evaluation. Zero for a normal bake.
  *  The tiling self-test dispatches with this set to one unit along an axis and
  *  compares against the zero-offset result; because the field is periodic with
  *  period exactly 1.0 in UVW, the two must agree. */
-float3	DomainOffset;
+float3 DomainOffset;
 
 // Gain, OutputMin, OutputMax, WorleyJitter
-float4	ChannelParamsA[4];
+float4 ChannelParamsA[4];
 
 // Basis, BasePeriod, Octaves, Lacunarity
-int4	ChannelParamsB[4];
+int4 ChannelParamsB[4];
 
-// Seed, Flags, unused, unused
-int4	ChannelParamsC[4];
+// Seed, Flags, DistributionMode, unused
+int4 ChannelParamsC[4];
 
-// NormalizeScale, NormalizeBias, unused, unused
-float4	ChannelNorm[4];
+// NormalizeScale, NormalizeBias, EncodeScale, EncodeBias
+float4 ChannelNorm[4];
+
+// DistributionGamma, PolarityScale, PolarityBias, unused
+float4 ChannelShaping[4];
+
+/** Per-channel equalization CDF, 64 scalar samples each, packed four to a
+ *  float4. Channel c occupies entries [c*16, c*16+16). */
+float4 ChannelEqLut[64];
 
 RWStructuredBuffer<float4> OutVolume;
 
 /** Raw FBM for one channel, before normalization and shaping. */
 float EvalChannelRaw(int ChannelIndex, float3 UVW)
 {
-	const float4 A = ChannelParamsA[ChannelIndex];
-	const int4   B = ChannelParamsB[ChannelIndex];
-	const int4   C = ChannelParamsC[ChannelIndex];
+    const float4 A = ChannelParamsA[ChannelIndex];
+    const int4 B = ChannelParamsB[ChannelIndex];
+    const int4 C = ChannelParamsC[ChannelIndex];
 
-	const bool bRidged = (C.y & PN_FLAG_RIDGED) != 0;
+    const bool bRidged = (C.y & PN_FLAG_RIDGED) != 0;
 
-	return PN_FBM(
+    return PN_FBM(
 		/* Basis      */ B.x,
 		/* UVW        */ UVW,
 		/* BasePeriod */ B.y,
 		/* Octaves    */ B.z,
 		/* Lacunarity */ B.w,
 		/* Gain       */ A.x,
-		/* Seed       */ (uint)C.x,
+		/* Seed       */ (uint) C.x,
 		/* Jitter     */ A.w,
 		/* bRidged    */ bRidged);
 }
 
-/** Normalization, output remap and inversion, in that order.
+#define NVB_STAGE_RAW			0
+#define NVB_STAGE_NORMALIZED	1
+#define NVB_STAGE_FULL			2
+
+#define NVB_DIST_NONE			0
+#define NVB_DIST_CENTER_MEDIAN	1
+#define NVB_DIST_EQUALIZE		2
+
+/** Reads sample index i of channel c from the packed equalization LUT. */
+float SampleEqLutRaw(int ChannelIndex, int SampleIndex)
+{
+    const float4 Packed = ChannelEqLut[ChannelIndex * 16 + (SampleIndex >> 2)];
+    const int Component = SampleIndex & 3;
+
+    return (Component == 0) ? Packed.x
+		 : (Component == 1) ? Packed.y
+		 : (Component == 2) ? Packed.z
+		 : Packed.w;
+}
+
+/** Linearly interpolated CDF lookup. The CDF is monotone and smooth, so 64
+ *  samples with a lerp between them is well past sufficient, and staying
+ *  monotone is what guarantees level sets survive. */
+float SampleEqLut(int ChannelIndex, float V)
+{
+    const float Position = saturate(V) * 63.0f;
+    const int Lower = (int) floor(Position);
+    const int Upper = min(Lower + 1, 63);
+    const float Fraction = Position - (float) Lower;
+
+    return lerp(SampleEqLutRaw(ChannelIndex, Lower), SampleEqLutRaw(ChannelIndex, Upper), Fraction);
+}
+
+/** Value redistribution. Monotone in every mode, so features never move. */
+float ApplyDistribution(int ChannelIndex, float V)
+{
+    const int Mode = ChannelParamsC[ChannelIndex].z;
+
+    if (Mode == NVB_DIST_CENTER_MEDIAN)
+    {
+		// v^g with g = ln(0.5)/ln(median), so the median lands on 0.5 while the
+		// endpoints stay pinned at 0 and 1.
+        return pow(max(V, 1e-6f), ChannelShaping[ChannelIndex].x);
+    }
+
+    if (Mode == NVB_DIST_EQUALIZE)
+    {
+        return SampleEqLut(ChannelIndex, V);
+    }
+
+    return V;
+}
+
+/** The full shaping chain, in order. Each step depends on the previous one
+ *  having put the value in a known space, so the order is not arbitrary:
  *
- *  Order matters: normalizing first means the remap operates on a signal that
- *  actually spans [0,1], so OutputMin/OutputMax mean what they say regardless
- *  of the basis's natural range. Inversion is last so it is unambiguous. */
+ *    normalize    raw FBM -> [0,1], so everything downstream has a fixed domain
+ *    redistribute [0,1] -> [0,1], monotone, so OutputMin/Max still mean what
+ *                 they say and no feature moves
+ *    remap        -> [OutputMin, OutputMax], both within the unit interval
+ *    invert       reflect about the range midpoint, NOT 1 - v; on a narrowed
+ *                 range the latter would flip the sign and shift the field
+ *    polarity     -> [-1,1] via v * 2 - 1, or identity
+ *    encode       fit a signed value into an unsigned storage format
+ */
 float ShapeChannel(int ChannelIndex, float Raw)
 {
-	const float4 A = ChannelParamsA[ChannelIndex];
-	const int4   C = ChannelParamsC[ChannelIndex];
-	const float4 N = ChannelNorm[ChannelIndex];
+    const float4 A = ChannelParamsA[ChannelIndex];
+    const int4 C = ChannelParamsC[ChannelIndex];
+    const float4 N = ChannelNorm[ChannelIndex];
+    const float4 S = ChannelShaping[ChannelIndex];
 
-	float V = saturate(Raw * N.x + N.y);
+    float V = saturate(Raw * N.x + N.y);
 
-	V = lerp(A.y, A.z, V);
+    if (ShapeStage == NVB_STAGE_NORMALIZED)
+    {
+        return V;
+    }
 
-	if ((C.y & PN_FLAG_INVERT) != 0)
-	{
-		V = 1.0f - V;
-	}
+    V = ApplyDistribution(ChannelIndex, V);
 
-	return V;
+    V = lerp(A.y, A.z, V);
+
+    if ((C.y & PN_FLAG_INVERT) != 0)
+    {
+        V = (A.y + A.z) - V;
+    }
+
+    V = V * S.y + S.z;
+
+    return V * N.z + N.w;
 }
 
 float4 EvalAllRaw(float3 UVW)
 {
-	return float4(
+    return float4(
 		EvalChannelRaw(0, UVW),
 		EvalChannelRaw(1, UVW),
 		EvalChannelRaw(2, UVW),
@@ -92,32 +181,32 @@ float4 EvalAllRaw(float3 UVW)
 [numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, THREADGROUP_SIZE)]
 void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 {
-	const int3 Local = (int3)DispatchThreadId;
+    const int3 Local = (int3) DispatchThreadId;
 
-	if (Local.x >= VolumeResolution.x ||
+    if (Local.x >= VolumeResolution.x ||
 		Local.y >= VolumeResolution.y ||
 		Local.z >= SliceCount)
-	{
-		return;
-	}
+    {
+        return;
+    }
 
-	const int3 Voxel = int3(Local.xy, Local.z + SliceOffset);
+    const int3 Voxel = int3(Local.xy, Local.z + SliceOffset);
 
-	const int SS = max(Supersample, 1);
-	const float InvSS = 1.0f / (float)SS;
-	const float InvSampleCount = 1.0f / (float)(SS * SS * SS);
+    const int SS = max(Supersample, 1);
+    const float InvSS = 1.0f / (float) SS;
+    const float InvSampleCount = 1.0f / (float) (SS * SS * SS);
 
-	float4 Accum = 0.0f;
+    float4 Accum = 0.0f;
 
 	[loop]
-	for (int sz = 0; sz < SS; ++sz)
-	{
+    for (int sz = 0; sz < SS; ++sz)
+    {
 		[loop]
-		for (int sy = 0; sy < SS; ++sy)
-		{
+        for (int sy = 0; sy < SS; ++sy)
+        {
 			[loop]
-			for (int sx = 0; sx < SS; ++sx)
-			{
+            for (int sx = 0; sx < SS; ++sx)
+            {
 				// Voxel-centre convention. With SS == 1 this is exactly
 				// (Voxel + 0.5) / Resolution, which places voxel 0 and voxel
 				// N-1 half a voxel inside the tile on either side, so they are
@@ -125,25 +214,25 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 				// Voxel / (Resolution - 1) instead duplicates the boundary row
 				// and produces a visible seam under an otherwise correct
 				// periodic function.
-				const float3 SubSample = (float3(sx, sy, sz) + 0.5f) * InvSS;
-				const float3 UVW = (float3(Voxel) + SubSample) / float3(VolumeResolution) + DomainOffset;
+                const float3 SubSample = (float3(sx, sy, sz) + 0.5f) * InvSS;
+                const float3 UVW = (float3(Voxel) + SubSample) / float3(VolumeResolution) + DomainOffset;
 
-				Accum += EvalAllRaw(UVW);
-			}
-		}
-	}
+                Accum += EvalAllRaw(UVW);
+            }
+        }
+    }
 
-	Accum *= InvSampleCount;
+    Accum *= InvSampleCount;
 
-	if (bApplyNormalize != 0)
-	{
-		Accum = float4(
+    if (ShapeStage != NVB_STAGE_RAW)
+    {
+        Accum = float4(
 			ShapeChannel(0, Accum.x),
 			ShapeChannel(1, Accum.y),
 			ShapeChannel(2, Accum.z),
 			ShapeChannel(3, Accum.w));
-	}
+    }
 
-	const int Index = (Local.z * VolumeResolution.y + Local.y) * VolumeResolution.x + Local.x;
-	OutVolume[Index] = Accum;
+    const int Index = (Local.z * VolumeResolution.y + Local.y) * VolumeResolution.x + Local.x;
+    OutVolume[Index] = Accum;
 }

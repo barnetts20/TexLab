@@ -94,7 +94,7 @@ void FNoiseVolumeBaker::BuildDispatchParams(const UNoiseBakeRecipe& Recipe, FNoi
 {
 	OutParams.Resolution = Recipe.Resolution;
 	OutParams.Supersample = FMath::Max(Recipe.Supersample, 1);
-	OutParams.bApplyNormalize = true;
+	OutParams.ShapeStage = ENoiseShapeStage::Full;
 	OutParams.DomainOffset = FVector3f::ZeroVector;
 
 	TArray<FNoiseChannelRecipe> Channels;
@@ -108,7 +108,7 @@ void FNoiseVolumeBaker::BuildDispatchParams(const UNoiseBakeRecipe& Recipe, FNoi
 
 		OutParams.ChannelParamsB[Index] = FIntVector4(
 			(int32)C.Basis,
-			FMath::Max(C.BasePeriod, 1),
+			C.GetBasePeriod(),
 			FMath::Max(C.Octaves, 1),
 			FMath::Max(C.Lacunarity, 2));
 
@@ -116,10 +116,29 @@ void FNoiseVolumeBaker::BuildDispatchParams(const UNoiseBakeRecipe& Recipe, FNoi
 		Flags |= C.bRidged ? NoiseBakeInternal::FlagRidged : 0;
 		Flags |= C.bInvert ? NoiseBakeInternal::FlagInvert : 0;
 
-		OutParams.ChannelParamsC[Index] = FIntVector4(C.Seed, Flags, 0, 0);
+		OutParams.ChannelParamsC[Index] = FIntVector4(C.Seed, Flags, (int32)C.DistributionMode, 0);
 
-		// Identity until the probe pass (or the manual range) fills it in.
-		OutParams.ChannelNorm[Index] = FVector4f(1.0f, 0.0f, 0.0f, 0.0f);
+		// Identity until the probe passes fill them in.
+		OutParams.ChannelNorm[Index] = FVector4f(1.0f, 0.0f, 1.0f, 0.0f);
+
+		// Gamma identity; polarity is known up front since it is a plain switch.
+		const float PolarityScale = C.bBipolarOutput ? 2.0f : 1.0f;
+		const float PolarityBias = C.bBipolarOutput ? -1.0f : 0.0f;
+
+		OutParams.ChannelShaping[Index] = FVector4f(1.0f, PolarityScale, PolarityBias, 0.0f);
+	}
+
+	// Identity LUT, so an Equalize channel is a no-op until the distribution
+	// probe replaces it. A zeroed LUT would silently flatten the channel to
+	// black, which is a much harder failure to recognise than no change at all.
+	for (int32 Entry = 0; Entry < 64; ++Entry)
+	{
+		const int32 Base = (Entry % 16) * 4;
+		OutParams.ChannelEqLut[Entry] = FVector4f(
+			(float)(Base + 0) / 63.0f,
+			(float)(Base + 1) / 63.0f,
+			(float)(Base + 2) / 63.0f,
+			(float)(Base + 3) / 63.0f);
 	}
 }
 
@@ -172,7 +191,7 @@ bool FNoiseVolumeBaker::DispatchSlab(
 			PassParams->SliceOffset = SliceOffset;
 			PassParams->SliceCount = SliceCount;
 			PassParams->Supersample = Params.Supersample;
-			PassParams->bApplyNormalize = Params.bApplyNormalize ? 1 : 0;
+			PassParams->ShapeStage = (int32)Params.ShapeStage;
 			PassParams->DomainOffset = Params.DomainOffset;
 
 			for (int32 Index = 0; Index < 4; ++Index)
@@ -181,6 +200,12 @@ bool FNoiseVolumeBaker::DispatchSlab(
 				PassParams->ChannelParamsB[Index] = Params.ChannelParamsB[Index];
 				PassParams->ChannelParamsC[Index] = Params.ChannelParamsC[Index];
 				PassParams->ChannelNorm[Index] = Params.ChannelNorm[Index];
+				PassParams->ChannelShaping[Index] = Params.ChannelShaping[Index];
+			}
+
+			for (int32 Entry = 0; Entry < 64; ++Entry)
+			{
+				PassParams->ChannelEqLut[Entry] = Params.ChannelEqLut[Entry];
 			}
 
 			PassParams->OutVolume = GraphBuilder.CreateUAV(OutBuffer);
@@ -297,7 +322,11 @@ bool FNoiseVolumeBaker::RunProbePass(
 	OutNormalization.SetNum(4);
 
 	const bool bNeedsProbe = Channels.ContainsByPredicate(
-		[](const FNoiseChannelRecipe& C) { return C.NormalizeMode == ENoiseNormalizeMode::AutoProbe; });
+		[](const FNoiseChannelRecipe& C)
+		{
+			return C.NormalizeMode == ENoiseNormalizeMode::AutoProbe
+				|| C.NormalizeMode == ENoiseNormalizeMode::AutoProbeSymmetric;
+		});
 
 	float ObservedMin[4] = { TNumericLimits<float>::Max(), TNumericLimits<float>::Max(), TNumericLimits<float>::Max(), TNumericLimits<float>::Max() };
 	float ObservedMax[4] = { TNumericLimits<float>::Lowest(), TNumericLimits<float>::Lowest(), TNumericLimits<float>::Lowest(), TNumericLimits<float>::Lowest() };
@@ -313,30 +342,74 @@ bool FNoiseVolumeBaker::RunProbePass(
 		FNoiseBakeDispatchParams ProbeParams = InOutParams;
 		ProbeParams.Resolution = ProbeResolution;
 		ProbeParams.Supersample = 1;
-		ProbeParams.bApplyNormalize = false; // raw FBM output
+		ProbeParams.ShapeStage = ENoiseShapeStage::Raw; // raw FBM output
 		ProbeParams.DomainOffset = FVector3f::ZeroVector;
 
 		auto Accumulate = [&ObservedMin, &ObservedMax](const TArray<FVector4f>& Slab, int32, int32)
-		{
-			for (const FVector4f& Texel : Slab)
 			{
-				ObservedMin[0] = FMath::Min(ObservedMin[0], Texel.X);
-				ObservedMin[1] = FMath::Min(ObservedMin[1], Texel.Y);
-				ObservedMin[2] = FMath::Min(ObservedMin[2], Texel.Z);
-				ObservedMin[3] = FMath::Min(ObservedMin[3], Texel.W);
+				for (const FVector4f& Texel : Slab)
+				{
+					ObservedMin[0] = FMath::Min(ObservedMin[0], Texel.X);
+					ObservedMin[1] = FMath::Min(ObservedMin[1], Texel.Y);
+					ObservedMin[2] = FMath::Min(ObservedMin[2], Texel.Z);
+					ObservedMin[3] = FMath::Min(ObservedMin[3], Texel.W);
 
-				ObservedMax[0] = FMath::Max(ObservedMax[0], Texel.X);
-				ObservedMax[1] = FMath::Max(ObservedMax[1], Texel.Y);
-				ObservedMax[2] = FMath::Max(ObservedMax[2], Texel.Z);
-				ObservedMax[3] = FMath::Max(ObservedMax[3], Texel.W);
-			}
-		};
+					ObservedMax[0] = FMath::Max(ObservedMax[0], Texel.X);
+					ObservedMax[1] = FMath::Max(ObservedMax[1], Texel.Y);
+					ObservedMax[2] = FMath::Max(ObservedMax[2], Texel.Z);
+					ObservedMax[3] = FMath::Max(ObservedMax[3], Texel.W);
+				}
+			};
 
 		if (!RunFullVolume(ProbeParams, Accumulate, nullptr, OutError))
 		{
 			return false;
 		}
 	}
+
+	// Merge probe ranges across normalization groups BEFORE deriving any scale.
+	//
+	// This is the step that makes vector output possible. Normalizing the
+	// components of a vector independently rescales each axis by a different
+	// factor, which rotates and skews every vector in the field. The result
+	// still looks like plausible noise, which is exactly what makes it
+	// dangerous: nothing in the preview reveals that the directions are wrong.
+	for (int32 Group = 1; Group <= 3; ++Group)
+	{
+		float GroupMin = TNumericLimits<float>::Max();
+		float GroupMax = TNumericLimits<float>::Lowest();
+		int32 MemberCount = 0;
+
+		for (int32 Index = 0; Index < 4; ++Index)
+		{
+			if (Channels[Index].NormalizationGroup == Group)
+			{
+				GroupMin = FMath::Min(GroupMin, ObservedMin[Index]);
+				GroupMax = FMath::Max(GroupMax, ObservedMax[Index]);
+				MemberCount++;
+			}
+		}
+
+		if (MemberCount < 2)
+		{
+			continue;
+		}
+
+		for (int32 Index = 0; Index < 4; ++Index)
+		{
+			if (Channels[Index].NormalizationGroup == Group)
+			{
+				ObservedMin[Index] = GroupMin;
+				ObservedMax[Index] = GroupMax;
+			}
+		}
+
+		UE_LOG(LogNoiseVolumeBaker, Log,
+			TEXT("Normalization group %d: %d channels sharing range [%.6f, %.6f]"),
+			Group, MemberCount, GroupMin, GroupMax);
+	}
+
+	const bool bUnsignedStorage = (Recipe.OutputFormat == ENoiseOutputFormat::BGRA8);
 
 	for (int32 Index = 0; Index < 4; ++Index)
 	{
@@ -348,6 +421,7 @@ bool FNoiseVolumeBaker::RunProbePass(
 		switch (C.NormalizeMode)
 		{
 		case ENoiseNormalizeMode::AutoProbe:
+		case ENoiseNormalizeMode::AutoProbeSymmetric:
 		{
 			RangeMin = ObservedMin[Index];
 			RangeMax = ObservedMax[Index];
@@ -357,7 +431,7 @@ bool FNoiseVolumeBaker::RunProbePass(
 			{
 				OutError = FString::Printf(
 					TEXT("Channel %d produced a constant field (probe range %.6f to %.6f). "
-						 "Check the basis and octave settings."),
+						"Check the basis and octave settings."),
 					Index, RangeMin, RangeMax);
 				return false;
 			}
@@ -367,6 +441,18 @@ bool FNoiseVolumeBaker::RunProbePass(
 			const float Padding = Span * NoiseBakeInternal::ProbePadding;
 			RangeMin -= Padding;
 			RangeMax += Padding;
+
+			if (C.NormalizeMode == ENoiseNormalizeMode::AutoProbeSymmetric)
+			{
+				// One magnitude either side of zero. Plain AutoProbe would map
+				// the observed minimum to 0, which moves the zero crossing to
+				// wherever the probe happened to land. For a vector component
+				// that is a constant offset, so a field that should integrate to
+				// zero net displacement acquires a drift.
+				const float Magnitude = FMath::Max(FMath::Abs(RangeMin), FMath::Abs(RangeMax));
+				RangeMin = -Magnitude;
+				RangeMax = Magnitude;
+			}
 			break;
 		}
 
@@ -385,12 +471,158 @@ bool FNoiseVolumeBaker::RunProbePass(
 		const float Scale = 1.0f / FMath::Max(RangeMax - RangeMin, KINDA_SMALL_NUMBER);
 		const float Bias = -RangeMin * Scale;
 
-		InOutParams.ChannelNorm[Index] = FVector4f(Scale, Bias, 0.0f, 0.0f);
+		// Storage encoding. A signed channel written to an unsigned format is
+		// bias-encoded from [-1,1] into [0,1]; everything else is identity.
+		//
+		// Note this is derived from the channel's OUTPUT RANGE rather than from
+		// its normalization, and the two are independent: a channel can be
+		// normalized symmetrically and still be remapped into [0,1] for output.
+		float EncodeScale = 1.0f;
+		float EncodeBias = 0.0f;
+
+		if (bUnsignedStorage && C.IsSigned())
+		{
+			EncodeScale = 0.5f;
+			EncodeBias = 0.5f;
+		}
+
+		const float DecodeScale = 1.0f / EncodeScale;
+		const float DecodeBias = -EncodeBias * DecodeScale;
+
+		InOutParams.ChannelNorm[Index] = FVector4f(Scale, Bias, EncodeScale, EncodeBias);
 
 		OutNormalization[Index].ObservedMin = RangeMin;
 		OutNormalization[Index].ObservedMax = RangeMax;
 		OutNormalization[Index].Scale = Scale;
 		OutNormalization[Index].Bias = Bias;
+		OutNormalization[Index].EncodeScale = EncodeScale;
+		OutNormalization[Index].EncodeBias = EncodeBias;
+		OutNormalization[Index].DecodeScale = DecodeScale;
+		OutNormalization[Index].DecodeBias = DecodeBias;
+		OutNormalization[Index].NormalizationGroup = C.NormalizationGroup;
+		OutNormalization[Index].bBipolar = C.bBipolarOutput;
+		OutNormalization[Index].DistributionMode = C.DistributionMode;
+	}
+
+	// -- Distribution probe -------------------------------------------------
+	//
+	// A second probe, now at the Normalized stage. It has to run after the
+	// ranges are settled, because redistribution operates on the normalized
+	// value: a histogram of raw values would have to be re-binned into [0,1]
+	// afterwards, losing resolution precisely around the median.
+	//
+	// Costs roughly what the range probe does, so about 2% of the bake total
+	// once both are running.
+
+	const bool bNeedsDistribution = Channels.ContainsByPredicate(
+		[](const FNoiseChannelRecipe& C) { return C.DistributionMode != ENoiseDistributionMode::None; });
+
+	if (!bNeedsDistribution)
+	{
+		return true;
+	}
+
+	int32 ProbeResolution = FMath::Clamp(Recipe.Resolution / 2, 32, 128);
+	ProbeResolution = 1 << FMath::FloorLog2(ProbeResolution);
+
+	FNoiseBakeDispatchParams DistParams = InOutParams;
+	DistParams.Resolution = ProbeResolution;
+	DistParams.Supersample = 1;
+	DistParams.ShapeStage = ENoiseShapeStage::Normalized;
+	DistParams.DomainOffset = FVector3f::ZeroVector;
+
+	const int32 NumBins = NoiseBakeConstants::HistogramBins;
+	TArray<int64> Histogram;
+	Histogram.SetNumZeroed(NumBins * 4);
+
+	auto AccumulateHistogram = [&Histogram, NumBins](const TArray<FVector4f>& Slab, int32, int32)
+		{
+			for (const FVector4f& Texel : Slab)
+			{
+				const float Values[4] = { Texel.X, Texel.Y, Texel.Z, Texel.W };
+				for (int32 Channel = 0; Channel < 4; ++Channel)
+				{
+					const int32 Bin = FMath::Clamp(
+						(int32)(FMath::Clamp(Values[Channel], 0.0f, 1.0f) * (NumBins - 1)), 0, NumBins - 1);
+					Histogram[Channel * NumBins + Bin]++;
+				}
+			}
+		};
+
+	if (!RunFullVolume(DistParams, AccumulateHistogram, nullptr, OutError))
+	{
+		return false;
+	}
+
+	for (int32 Index = 0; Index < 4; ++Index)
+	{
+		const FNoiseChannelRecipe& C = Channels[Index];
+
+		// Cumulative distribution, normalized to [0,1].
+		TArray<float> Cdf;
+		Cdf.SetNumUninitialized(NumBins);
+
+		int64 Running = 0;
+		for (int32 Bin = 0; Bin < NumBins; ++Bin)
+		{
+			Running += Histogram[Index * NumBins + Bin];
+			Cdf[Bin] = (float)Running;
+		}
+
+		const float Total = FMath::Max(Cdf[NumBins - 1], 1.0f);
+		for (int32 Bin = 0; Bin < NumBins; ++Bin)
+		{
+			Cdf[Bin] /= Total;
+		}
+
+		// Median, by linear interpolation across the bin where the CDF crosses
+		// one half.
+		float Median = 0.5f;
+		for (int32 Bin = 0; Bin < NumBins; ++Bin)
+		{
+			if (Cdf[Bin] >= 0.5f)
+			{
+				const float Previous = (Bin > 0) ? Cdf[Bin - 1] : 0.0f;
+				const float Span = FMath::Max(Cdf[Bin] - Previous, KINDA_SMALL_NUMBER);
+				Median = ((float)Bin + (0.5f - Previous) / Span) / (float)(NumBins - 1);
+				break;
+			}
+		}
+
+		OutNormalization[Index].ObservedMedian = Median;
+
+		if (C.DistributionMode == ENoiseDistributionMode::CenterMedian)
+		{
+			// v^g with g = ln(0.5)/ln(median). Guarded because a median at 0 or
+			// 1 means the channel is degenerate and there is no exponent that
+			// centres it.
+			const float SafeMedian = FMath::Clamp(Median, 0.001f, 0.999f);
+			const float Gamma = FMath::Loge(0.5f) / FMath::Loge(SafeMedian);
+
+			InOutParams.ChannelShaping[Index].X = Gamma;
+			OutNormalization[Index].DistributionGamma = Gamma;
+
+			UE_LOG(LogNoiseVolumeBaker, Log,
+				TEXT("Channel %d median %.4f, centering gamma %.4f"), Index, Median, Gamma);
+		}
+		else if (C.DistributionMode == ENoiseDistributionMode::Equalize)
+		{
+			// The equalizing transform IS the CDF: mapping every value to its
+			// own cumulative probability produces a uniform distribution.
+			const int32 LutSize = NoiseBakeConstants::EqualizationLutSize;
+
+			for (int32 Sample = 0; Sample < LutSize; ++Sample)
+			{
+				const float T = (float)Sample / (float)(LutSize - 1);
+				const int32 Bin = FMath::Clamp((int32)(T * (NumBins - 1)), 0, NumBins - 1);
+
+				const int32 Entry = Index * 16 + (Sample >> 2);
+				InOutParams.ChannelEqLut[Entry][Sample & 3] = Cdf[Bin];
+			}
+
+			UE_LOG(LogNoiseVolumeBaker, Log,
+				TEXT("Channel %d median %.4f, equalized"), Index, Median);
+		}
 	}
 
 	return true;
@@ -415,7 +647,7 @@ bool FNoiseVolumeBaker::RunTilingSelfTest(
 	FNoiseBakeDispatchParams TestParams = Params;
 	TestParams.Resolution = ProbeResolution;
 	TestParams.Supersample = 1;
-	TestParams.bApplyNormalize = false;
+	TestParams.ShapeStage = ENoiseShapeStage::Raw;
 	TestParams.DomainOffset = FVector3f::ZeroVector;
 
 	TArray<FVector4f> Reference;
@@ -467,7 +699,7 @@ bool FNoiseVolumeBaker::RunTilingSelfTest(
 		{
 			OutError = FString::Printf(
 				TEXT("Tiling self-test FAILED on the %s axis. Max difference between f(uvw) and f(uvw + 1) "
-					 "was %.9f on channel %d, tolerance is %.9f. The generated volume would not tile."),
+					"was %.9f on channel %d, tolerance is %.9f. The generated volume would not tile."),
 				AxisNames[Axis], MaxDelta, WorstChannel, Tolerance);
 			return false;
 		}
@@ -485,49 +717,70 @@ void FNoiseVolumeBaker::QuantizeSlab(
 	int32 Resolution,
 	int32 SliceOffset,
 	int32 SliceCount,
+	ENoiseOutputFormat Format,
 	bool bDither,
 	TArray<uint8>& OutTexels)
 {
-	// TSF_BGRA8 source layout: byte order is B, G, R, A. The float4 carries
-	// RGBA in channel order, so the write is deliberately swizzled here rather
-	// than in the shader, keeping the shader's channel indices matching the
-	// recipe's channel names.
+	// The shader has already applied storage encoding, so everything arriving
+	// here is in [0,1] for BGRA8 and in its natural signed range for RGBA16F.
+
+	const bool bHalfFloat = (Format == ENoiseOutputFormat::RGBA16F);
+	const int64 BytesPerTexel = bHalfFloat ? 8 : 4;
 
 	ParallelFor(SliceCount, [&](int32 LocalZ)
-	{
-		const int32 GlobalZ = SliceOffset + LocalZ;
-
-		for (int32 Y = 0; Y < Resolution; ++Y)
 		{
-			const int64 RowSrc = ((int64)LocalZ * Resolution + Y) * Resolution;
-			const int64 RowDst = (((int64)GlobalZ * Resolution + Y) * Resolution) * 4;
+			const int32 GlobalZ = SliceOffset + LocalZ;
 
-			for (int32 X = 0; X < Resolution; ++X)
+			for (int32 Y = 0; Y < Resolution; ++Y)
 			{
-				const FVector4f& Texel = Slab[RowSrc + X];
-				const float Values[4] = { Texel.X, Texel.Y, Texel.Z, Texel.W };
+				const int64 RowSrc = ((int64)LocalZ * Resolution + Y) * Resolution;
+				const int64 RowDst = ((int64)GlobalZ * Resolution + Y) * Resolution * BytesPerTexel;
 
-				uint8 Bytes[4];
-				for (int32 Channel = 0; Channel < 4; ++Channel)
+				for (int32 X = 0; X < Resolution; ++X)
 				{
-					float Scaled = FMath::Clamp(Values[Channel], 0.0f, 1.0f) * 255.0f;
+					const FVector4f& Texel = Slab[RowSrc + X];
+					const int64 Dst = RowDst + (int64)X * BytesPerTexel;
 
-					if (bDither)
+					if (bHalfFloat)
 					{
-						Scaled += NoiseBakeInternal::TriangularDither(X, Y, GlobalZ, Channel);
+						// TSF_RGBA16F is FFloat16Color, which is RGBA order. No
+						// swizzle, and no dither: half float has no uniform
+						// quantization step to dither against, and the precision is
+						// already well past what banding needs.
+						FFloat16Color* Out = reinterpret_cast<FFloat16Color*>(OutTexels.GetData() + Dst);
+						Out->R = Texel.X;
+						Out->G = Texel.Y;
+						Out->B = Texel.Z;
+						Out->A = Texel.W;
+						continue;
 					}
 
-					Bytes[Channel] = (uint8)FMath::Clamp(FMath::RoundToInt(Scaled), 0, 255);
-				}
+					// TSF_BGRA8 byte order is B, G, R, A. The float4 carries RGBA in
+					// channel order, so the swizzle lives here rather than in the
+					// shader, keeping the shader's channel indices matching the
+					// recipe's channel names.
+					const float Values[4] = { Texel.X, Texel.Y, Texel.Z, Texel.W };
 
-				const int64 Dst = RowDst + (int64)X * 4;
-				OutTexels[Dst + 0] = Bytes[2]; // B
-				OutTexels[Dst + 1] = Bytes[1]; // G
-				OutTexels[Dst + 2] = Bytes[0]; // R
-				OutTexels[Dst + 3] = Bytes[3]; // A
+					uint8 Bytes[4];
+					for (int32 Channel = 0; Channel < 4; ++Channel)
+					{
+						float Scaled = FMath::Clamp(Values[Channel], 0.0f, 1.0f) * 255.0f;
+
+						if (bDither)
+						{
+							Scaled += NoiseBakeInternal::TriangularDither(X, Y, GlobalZ, Channel);
+						}
+
+						Bytes[Channel] = (uint8)FMath::Clamp(FMath::RoundToInt(Scaled), 0, 255);
+					}
+
+					OutTexels[Dst + 0] = Bytes[2]; // B
+					OutTexels[Dst + 1] = Bytes[1]; // G
+					OutTexels[Dst + 2] = Bytes[0]; // R
+					OutTexels[Dst + 3] = Bytes[3]; // A
+				}
 			}
-		}
-	});
+		});
 }
 
 // ---------------------------------------------------------------------------
@@ -538,8 +791,10 @@ void FNoiseVolumeBaker::BuildBrickBounds(
 	const TArray<uint8>& Texels,
 	int32 Resolution,
 	int32 BrickSize,
+	ENoiseOutputFormat Format,
+	const TArray<FNoiseChannelNormalization>& Normalization,
 	FIntVector& OutDimensions,
-	TArray<uint8>& OutBrickMinMax)
+	TArray<float>& OutBrickMinMax)
 {
 	const int32 BrickDim = Resolution / BrickSize;
 	OutDimensions = FIntVector(BrickDim, BrickDim, BrickDim);
@@ -547,53 +802,89 @@ void FNoiseVolumeBaker::BuildBrickBounds(
 	const int64 NumBricks = (int64)BrickDim * BrickDim * BrickDim;
 	OutBrickMinMax.SetNumUninitialized(NumBricks * 8);
 
-	// Source byte order is BGRA; the brick record is written in RGBA order to
-	// match the channel naming everywhere else.
-	static const int32 SourceChannelForRGBA[4] = { 2, 1, 0, 3 };
+	const bool bHalfFloat = (Format == ENoiseOutputFormat::RGBA16F);
+	const int64 BytesPerTexel = bHalfFloat ? 8 : 4;
+
+	// Bounds are recorded in DECODED field space, so they carry sign for a
+	// signed channel and stay meaningful if the output format changes later.
+	float DecodeScale[4];
+	float DecodeBias[4];
+	for (int32 Channel = 0; Channel < 4; ++Channel)
+	{
+		DecodeScale[Channel] = Normalization.IsValidIndex(Channel) ? Normalization[Channel].DecodeScale : 1.0f;
+		DecodeBias[Channel] = Normalization.IsValidIndex(Channel) ? Normalization[Channel].DecodeBias : 0.0f;
+	}
+
+	// Storage byte order is BGRA for the 8-bit path and RGBA for half float.
+	static const int32 BgraSourceForRGBA[4] = { 2, 1, 0, 3 };
+
+	const uint8* Base = Texels.GetData();
 
 	ParallelFor(BrickDim, [&](int32 BrickZ)
-	{
-		for (int32 BrickY = 0; BrickY < BrickDim; ++BrickY)
 		{
-			for (int32 BrickX = 0; BrickX < BrickDim; ++BrickX)
+			for (int32 BrickY = 0; BrickY < BrickDim; ++BrickY)
 			{
-				uint8 MinValue[4] = { 255, 255, 255, 255 };
-				uint8 MaxValue[4] = { 0, 0, 0, 0 };
-
-				for (int32 z = 0; z < BrickSize; ++z)
+				for (int32 BrickX = 0; BrickX < BrickDim; ++BrickX)
 				{
-					const int32 GlobalZ = BrickZ * BrickSize + z;
+					float MinValue[4] = {
+						TNumericLimits<float>::Max(), TNumericLimits<float>::Max(),
+						TNumericLimits<float>::Max(), TNumericLimits<float>::Max() };
+					float MaxValue[4] = {
+						TNumericLimits<float>::Lowest(), TNumericLimits<float>::Lowest(),
+						TNumericLimits<float>::Lowest(), TNumericLimits<float>::Lowest() };
 
-					for (int32 y = 0; y < BrickSize; ++y)
+					for (int32 z = 0; z < BrickSize; ++z)
 					{
-						const int32 GlobalY = BrickY * BrickSize + y;
-						const int64 RowBase = (((int64)GlobalZ * Resolution + GlobalY) * Resolution + (int64)BrickX * BrickSize) * 4;
+						const int32 GlobalZ = BrickZ * BrickSize + z;
 
-						for (int32 x = 0; x < BrickSize; ++x)
+						for (int32 y = 0; y < BrickSize; ++y)
 						{
-							const int64 Base = RowBase + (int64)x * 4;
+							const int32 GlobalY = BrickY * BrickSize + y;
+							const int64 RowBase =
+								(((int64)GlobalZ * Resolution + GlobalY) * Resolution + (int64)BrickX * BrickSize) * BytesPerTexel;
 
-							for (int32 Channel = 0; Channel < 4; ++Channel)
+							for (int32 x = 0; x < BrickSize; ++x)
 							{
-								const uint8 Value = Texels[Base + SourceChannelForRGBA[Channel]];
-								MinValue[Channel] = FMath::Min(MinValue[Channel], Value);
-								MaxValue[Channel] = FMath::Max(MaxValue[Channel], Value);
+								const int64 Offset = RowBase + (int64)x * BytesPerTexel;
+
+								float Stored[4];
+								if (bHalfFloat)
+								{
+									const FFloat16Color* Texel = reinterpret_cast<const FFloat16Color*>(Base + Offset);
+									Stored[0] = Texel->R.GetFloat();
+									Stored[1] = Texel->G.GetFloat();
+									Stored[2] = Texel->B.GetFloat();
+									Stored[3] = Texel->A.GetFloat();
+								}
+								else
+								{
+									for (int32 Channel = 0; Channel < 4; ++Channel)
+									{
+										Stored[Channel] = (float)Base[Offset + BgraSourceForRGBA[Channel]] * (1.0f / 255.0f);
+									}
+								}
+
+								for (int32 Channel = 0; Channel < 4; ++Channel)
+								{
+									const float Value = Stored[Channel] * DecodeScale[Channel] + DecodeBias[Channel];
+									MinValue[Channel] = FMath::Min(MinValue[Channel], Value);
+									MaxValue[Channel] = FMath::Max(MaxValue[Channel], Value);
+								}
 							}
 						}
 					}
-				}
 
-				const int64 BrickIndex = ((int64)BrickZ * BrickDim + BrickY) * BrickDim + BrickX;
-				const int64 Out = BrickIndex * 8;
+					const int64 BrickIndex = ((int64)BrickZ * BrickDim + BrickY) * BrickDim + BrickX;
+					const int64 Out = BrickIndex * 8;
 
-				for (int32 Channel = 0; Channel < 4; ++Channel)
-				{
-					OutBrickMinMax[Out + Channel] = MinValue[Channel];
-					OutBrickMinMax[Out + 4 + Channel] = MaxValue[Channel];
+					for (int32 Channel = 0; Channel < 4; ++Channel)
+					{
+						OutBrickMinMax[Out + Channel] = MinValue[Channel];
+						OutBrickMinMax[Out + 4 + Channel] = MaxValue[Channel];
+					}
 				}
 			}
-		}
-	});
+		});
 }
 
 // ---------------------------------------------------------------------------
@@ -651,10 +942,11 @@ bool FNoiseVolumeBaker::WriteTexture(
 	const TArray<uint8>& Texels,
 	const TArray<FNoiseChannelNormalization>& Normalization,
 	const FIntVector& BrickDimensions,
-	const TArray<uint8>& BrickMinMax,
+	const TArray<float>& BrickMinMax,
 	FString& OutError)
 {
 	const int32 Resolution = Recipe.Resolution;
+	const bool bHalfFloat = (Recipe.OutputFormat == ENoiseOutputFormat::RGBA16F);
 
 	Texture.PreEditChange(nullptr);
 
@@ -666,24 +958,31 @@ bool FNoiseVolumeBaker::WriteTexture(
 		Resolution,
 		/*NumSlices=*/Resolution,
 		/*NumMips=*/1,
-		TSF_BGRA8,
+		bHalfFloat ? TSF_RGBA16F : TSF_BGRA8,
 		Texels.GetData());
 
 	Texture.SRGB = false;
-	Texture.CompressionSettings = TC_VectorDisplacementmap; // uncompressed BGRA8
+
+	// TC_HDR is uncompressed RGBA16F; TC_VectorDisplacementmap is uncompressed
+	// BGRA8. Block compression is not an option for either: it moves the
+	// isosurface and shows block structure across slices, and for a signed
+	// vector channel it would also skew directions.
+	Texture.CompressionSettings = bHalfFloat ? TC_HDR : TC_VectorDisplacementmap;
 	Texture.CompressionNone = true;
 	Texture.MipGenSettings = Recipe.bGenerateMips ? TMGS_SimpleAverage : TMGS_NoMipmaps;
 	Texture.Filter = TF_Trilinear;
 	Texture.NeverStream = true;
 
 	// Bake record. Written to the texture so a consumer can tell which bake it
-	// is looking at without going back to the recipe.
+	// is looking at, and decode signed channels, without going back to the
+	// recipe.
 	Texture.RemoveUserDataOfClass(UNoiseBakeAssetUserData::StaticClass());
 
 	UNoiseBakeAssetUserData* UserData = NewObject<UNoiseBakeAssetUserData>(&Texture);
 	UserData->BakeGuid = Recipe.LastBakeGuid;
 	UserData->BakeVersion = Recipe.BakeVersion;
 	UserData->Resolution = Resolution;
+	UserData->OutputFormat = Recipe.OutputFormat;
 	UserData->ChannelNormalization = Normalization;
 
 	TArray<FNoiseChannelRecipe> Channels;
@@ -691,7 +990,7 @@ bool FNoiseVolumeBaker::WriteTexture(
 	UserData->ChannelBasePeriods.Reset(4);
 	for (const FNoiseChannelRecipe& C : Channels)
 	{
-		UserData->ChannelBasePeriods.Add(C.BasePeriod);
+		UserData->ChannelBasePeriods.Add(C.GetBasePeriod());
 	}
 
 	if (Recipe.bBakeBrickBounds)
@@ -791,7 +1090,8 @@ bool FNoiseVolumeBaker::Bake(UNoiseBakeRecipe* Recipe, FString& OutError)
 
 	// -- Main bake ----------------------------------------------------------
 
-	const int64 TotalBytes = (int64)Resolution * Resolution * Resolution * 4;
+	const int64 BytesPerTexel = (Recipe->OutputFormat == ENoiseOutputFormat::RGBA16F) ? 8 : 4;
+	const int64 TotalBytes = (int64)Resolution * Resolution * Resolution * BytesPerTexel;
 
 	TArray<uint8> Texels;
 	Texels.SetNumUninitialized(TotalBytes);
@@ -799,12 +1099,13 @@ bool FNoiseVolumeBaker::Bake(UNoiseBakeRecipe* Recipe, FString& OutError)
 	{
 		FScopedSlowTask SliceProgress(1.0f, LOCTEXT("BakingSlices", "Evaluating volume"));
 
+		const ENoiseOutputFormat Format = Recipe->OutputFormat;
 		const bool bDither = Recipe->bDither;
 
-		auto OnSlab = [&Texels, Resolution, bDither](const TArray<FVector4f>& Slab, int32 SliceOffset, int32 SliceCount)
-		{
-			QuantizeSlab(Slab, Resolution, SliceOffset, SliceCount, bDither, Texels);
-		};
+		auto OnSlab = [&Texels, Resolution, Format, bDither](const TArray<FVector4f>& Slab, int32 SliceOffset, int32 SliceCount)
+			{
+				QuantizeSlab(Slab, Resolution, SliceOffset, SliceCount, Format, bDither, Texels);
+			};
 
 		if (!RunFullVolume(Params, OnSlab, &SliceProgress, OutError))
 		{
@@ -817,11 +1118,14 @@ bool FNoiseVolumeBaker::Bake(UNoiseBakeRecipe* Recipe, FString& OutError)
 	// -- Bricks -------------------------------------------------------------
 
 	FIntVector BrickDimensions = FIntVector::ZeroValue;
-	TArray<uint8> BrickMinMax;
+	TArray<float> BrickMinMax;
 
 	if (Recipe->bBakeBrickBounds)
 	{
-		BuildBrickBounds(Texels, Resolution, Recipe->BrickSize, BrickDimensions, BrickMinMax);
+		BuildBrickBounds(
+			Texels, Resolution, Recipe->BrickSize,
+			Recipe->OutputFormat, Normalization,
+			BrickDimensions, BrickMinMax);
 	}
 
 	// -- Stamp and write ----------------------------------------------------

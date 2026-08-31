@@ -27,7 +27,7 @@ public:
 		SHADER_PARAMETER(int32, SliceOffset)
 		SHADER_PARAMETER(int32, SliceCount)
 		SHADER_PARAMETER(int32, Supersample)
-		SHADER_PARAMETER(int32, bApplyNormalize)
+		SHADER_PARAMETER(int32, ShapeStage)
 		SHADER_PARAMETER(FVector3f, DomainOffset)
 
 		/** x: Gain, y: OutputMin, z: OutputMax, w: WorleyJitter */
@@ -36,15 +36,22 @@ public:
 		/** x: Basis, y: BasePeriod, z: Octaves, w: Lacunarity */
 		SHADER_PARAMETER_ARRAY(FIntVector4, ChannelParamsB, [4])
 
-		/** x: Seed, y: Flags (PN_FLAG_*), z/w: unused */
+		/** x: Seed, y: Flags (PN_FLAG_*), z: DistributionMode, w: unused */
 		SHADER_PARAMETER_ARRAY(FIntVector4, ChannelParamsC, [4])
 
-		/** x: NormalizeScale, y: NormalizeBias, z/w: unused */
+		/** x: NormalizeScale, y: NormalizeBias, z: EncodeScale, w: EncodeBias */
 		SHADER_PARAMETER_ARRAY(FVector4f, ChannelNorm, [4])
 
-		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, OutVolume)
-	END_SHADER_PARAMETER_STRUCT()
+		/** x: DistributionGamma, y: PolarityScale, z: PolarityBias, w: unused */
+		SHADER_PARAMETER_ARRAY(FVector4f, ChannelShaping, [4])
 
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters);
+		/** Per-channel equalization CDF, 64 scalars each packed four to a
+		 *  float4. Channel c occupies entries [c*16, c*16+16). */
+		SHADER_PARAMETER_ARRAY(FVector4f, ChannelEqLut, [64])
+
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, OutVolume)
+		END_SHADER_PARAMETER_STRUCT()
+
+		static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters);
 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment);
 };

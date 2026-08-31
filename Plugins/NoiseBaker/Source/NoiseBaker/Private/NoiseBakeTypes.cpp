@@ -23,13 +23,34 @@ namespace NoiseBakeValidation
 		return true;
 	}
 
+	int32 GetMaxOctaves(int32 Resolution, int32 BasePeriod, int32 Lacunarity)
+	{
+		BasePeriod = FMath::Max(BasePeriod, 1);
+		Lacunarity = FMath::Max(Lacunarity, 2);
+
+		// The finest octave must still get MinVoxelsPerFinestCell voxels per
+		// cell. Counted by repeated multiplication rather than a log, so the
+		// answer cannot disagree with GetFinestPeriod by a rounding step.
+		if (BasePeriod * MinVoxelsPerFinestCell > Resolution)
+		{
+			return 0;
+		}
+
+		int32 Octaves = 1;
+		int32 Period = BasePeriod;
+
+		while ((int64)Period * Lacunarity * MinVoxelsPerFinestCell <= (int64)Resolution)
+		{
+			Period *= Lacunarity;
+			Octaves++;
+		}
+
+		return Octaves;
+	}
+
 	bool ValidateChannel(const FNoiseChannelRecipe& Channel, int32 Resolution, const TCHAR* ChannelName, FString& OutError)
 	{
-		if (Channel.BasePeriod < 1)
-		{
-			OutError = FString::Printf(TEXT("%s: BasePeriod must be at least 1."), ChannelName);
-			return false;
-		}
+		const int32 BasePeriod = Channel.GetBasePeriod();
 
 		if (Channel.Octaves < 1)
 		{
@@ -49,17 +70,26 @@ namespace NoiseBakeValidation
 		// Nyquist. The finest octave lays FinestPeriod cells across the volume;
 		// below a few voxels per cell it degenerates into uncorrelated hash noise
 		// that also destroys the mip chain.
-		const int32 FinestPeriod = Channel.GetFinestPeriod();
-		const int32 RequiredResolution = FinestPeriod * MinVoxelsPerFinestCell;
+		const int32 MaxOctaves = GetMaxOctaves(Resolution, BasePeriod, Channel.Lacunarity);
 
-		if (Resolution < RequiredResolution)
+		if (MaxOctaves == 0)
 		{
 			OutError = FString::Printf(
-				TEXT("%s: finest octave lays %d cells across the volume (BasePeriod %d x Lacunarity %d ^ %d octaves), ")
-				TEXT("which needs at least %d voxels of resolution to resolve. Current resolution is %d. ")
-				TEXT("Reduce Octaves, reduce BasePeriod, or raise Resolution."),
-				ChannelName, FinestPeriod, Channel.BasePeriod, Channel.Lacunarity, Channel.Octaves - 1,
-				RequiredResolution, Resolution);
+				TEXT("%s: base period %d needs at least %d voxels of resolution on its own, but the ")
+				TEXT("volume is %d^3. Drop the base period or raise the resolution."),
+				ChannelName, BasePeriod, BasePeriod * MinVoxelsPerFinestCell, Resolution);
+			return false;
+		}
+
+		if (Channel.Octaves > MaxOctaves)
+		{
+			OutError = FString::Printf(
+				TEXT("%s: %d octaves at base period %d and lacunarity %d lays %d cells across the volume ")
+				TEXT("at the finest octave, which needs %d voxels of resolution. The volume is %d^3, so the ")
+				TEXT("maximum here is %d octaves."),
+				ChannelName, Channel.Octaves, BasePeriod, Channel.Lacunarity,
+				Channel.GetFinestPeriod(), Channel.GetFinestPeriod() * MinVoxelsPerFinestCell,
+				Resolution, MaxOctaves);
 			return false;
 		}
 
@@ -70,6 +100,28 @@ namespace NoiseBakeValidation
 				TEXT("rather than crossing the output range."),
 				ChannelName, Channel.OutputMax, Channel.OutputMin);
 			return false;
+		}
+
+		if (Channel.IsSigned() && Channel.NormalizeMode == ENoiseNormalizeMode::AutoProbe)
+		{
+			OutError = FString::Printf(
+				TEXT("%s: bBipolarOutput is set, but the normalize mode is plain Auto. Auto maps the ")
+				TEXT("observed minimum to 0, so after the polarity conversion the zero crossing sits ")
+				TEXT("wherever the probe happened to land rather than at the middle of the field. Use ")
+				TEXT("Auto (Symmetric About Zero) for any channel whose sign is meaningful."),
+				ChannelName);
+			return false;
+		}
+
+		if (Channel.bBipolarOutput && Channel.DistributionMode != ENoiseDistributionMode::None)
+		{
+			// Redistribution centres on 0.5 in unipolar space, which maps to 0
+			// after the polarity conversion. That is usually what you want, so
+			// this is a note rather than an error, but the two features interact
+			// and it is worth saying so out loud.
+			UE_LOG(LogTemp, Log,
+				TEXT("NoiseBaker: %s combines bipolar output with redistribution; the redistributed ")
+				TEXT("median at 0.5 becomes the zero crossing."), ChannelName);
 		}
 
 		if (Channel.NormalizeMode == ENoiseNormalizeMode::Manual &&

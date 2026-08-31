@@ -10,20 +10,133 @@ UENUM(BlueprintType)
 enum class ENoiseBasis : uint8
 {
 	/** Interpolated per-cell random scalar. Soft, cheap, no directional bias. */
-	Value				= 0	UMETA(DisplayName = "Value"),
+	Value = 0	UMETA(DisplayName = "Value"),
 
 	/** Classic gradient noise. The default for warp and general detail. */
-	Perlin				= 1	UMETA(DisplayName = "Perlin"),
+	Perlin = 1	UMETA(DisplayName = "Perlin"),
 
 	/** Cellular F1, inverted so 1.0 sits at the feature point. Billowy. */
-	WorleyF1			= 2	UMETA(DisplayName = "Worley F1"),
+	WorleyF1 = 2	UMETA(DisplayName = "Worley F1"),
 
 	/** Cellular F2-F1. Produces the cell-boundary web rather than blobs. */
-	WorleyF2MinusF1		= 3	UMETA(DisplayName = "Worley F2 - F1"),
+	WorleyF2MinusF1 = 3	UMETA(DisplayName = "Worley F2 - F1"),
 
 	/** Perlin remapped by inverted Worley. The standard cloud base signal. */
-	PerlinWorley		= 4	UMETA(DisplayName = "Perlin-Worley"),
+	PerlinWorley = 4	UMETA(DisplayName = "Perlin-Worley"),
 };
+
+/** Standardized tiling periods.
+ *
+ *  Restricted to powers of two because every other value is dominated. The
+ *  Nyquist rule caps octaves at floor(log_L(Resolution / (4 * BasePeriod))) + 1,
+ *  which is a step function whose breakpoints land on powers of two: periods 3
+ *  and 4 permit the same octave count, as do 5 through 8. Within a bracket the
+ *  largest value gives the finest base features for the same budget, so the top
+ *  of each bracket, which is always a power of two, is the only one worth
+ *  offering.
+ *
+ *  Note that this is the BAKED period. Sampling the result at an integer UV
+ *  multiple in a material is also tiling-safe and gives finer features, but it
+ *  shortens the repeat distance by the same factor, so it is a trade rather
+ *  than a substitute for baking a higher period. Where material-side scaling
+ *  does pay is in multi-lookup composition: two lookups at co-prime scales,
+ *  say 3 and 5, have a combined period of 15 tiles. Power-of-two scales would
+ *  simply collapse back to the largest. */
+UENUM(BlueprintType)
+enum class ENoiseBasePeriod : uint8
+{
+	P1 = 1		UMETA(DisplayName = "1 (whole tile)"),
+	P2 = 2		UMETA(DisplayName = "2"),
+	P4 = 4		UMETA(DisplayName = "4"),
+	P8 = 8		UMETA(DisplayName = "8"),
+	P16 = 16	UMETA(DisplayName = "16"),
+	P32 = 32	UMETA(DisplayName = "32"),
+	P64 = 64	UMETA(DisplayName = "64"),
+};
+
+/** Storage format for the baked volume. */
+UENUM(BlueprintType)
+enum class ENoiseOutputFormat : uint8
+{
+	/** Uncompressed BGRA8. 4 bytes per voxel. Signed channels are bias-encoded
+	 *  into [0,1] on write, which spends the 256 levels across [-1,1] and leaves
+	 *  a quantization step of about 1/127.
+	 *
+	 *  Fine for density. Marginal for a warp or vector field, because warp error
+	 *  is amplified by the gradient of whatever it displaces: a stair-step in the
+	 *  offset becomes a stair-step in the result. */
+	BGRA8 = 0	UMETA(DisplayName = "BGRA8 (4 bpp)"),
+
+	/** Uncompressed RGBA16F. 8 bytes per voxel. Stores signed values directly
+	 *  with no encoding, so the decode is identity and precision is not spent on
+	 *  representing the sign.
+	 *
+	 *  The right choice for curl and warp volumes, which want to be low
+	 *  resolution anyway: 64^3 is 2 MB, 128^3 is 16 MB. */
+	RGBA16F = 1	UMETA(DisplayName = "RGBA16F (8 bpp)"),
+};
+
+/** Optional value redistribution applied after normalization.
+ *
+ *  Every mode here is a MONOTONE remap of value, which means it preserves every
+ *  level set exactly: the set {v > t} simply becomes {v > t'}. Features do not
+ *  move, isosurfaces keep their geometry, nothing is reshaped spatially. Only
+ *  the labels on the values change.
+ *
+ *  The problem this solves: normalization fixes the RANGE and says nothing about
+ *  the DISTRIBUTION within it, and the archetypes differ enormously. Perlin FBM
+ *  is near-Gaussian and clusters tightly around the middle. Worley F1 is heavily
+ *  skewed low, because in 3D the volume within radius r grows as r^3, so most of
+ *  the space is far from any feature point. Ridged variants pile up at the top,
+ *  since folding about the midpoint stacks two halves of the distribution.
+ *
+ *  So pow(v, 2) nudges Perlin slightly dark and nearly annihilates Worley F1.
+ *  Redistribution is what lets one set of multipliers and exponents mean the
+ *  same thing on every channel. */
+UENUM(BlueprintType)
+enum class ENoiseDistributionMode : uint8
+{
+	/** Leave the distribution alone. */
+	None = 0	UMETA(DisplayName = "None"),
+
+	/** Apply v^g with g chosen so the median lands exactly on 0.5. Endpoints
+	 *  stay pinned at 0 and 1.
+	 *
+	 *  Fixes the midpoint but not the spread: Perlin stays tightly clustered and
+	 *  Worley stays broad, so an exponent still bites harder on one than the
+	 *  other, just from a common centre. Cheap, and it preserves most of each
+	 *  basis's character. */
+	CenterMedian = 1	UMETA(DisplayName = "Center Median"),
+
+	/** Full histogram equalization: every channel comes out uniformly
+	 *  distributed over [0,1], so all statistics match and a given exponent or
+	 *  multiplier means the same thing everywhere.
+	 *
+	 *  The cost is character. Perlin's softness comes precisely from its values
+	 *  clustering, and uniformizing it reads harsher even though not one feature
+	 *  has moved. Ridged variants change most, since the high-end pile-up is
+	 *  exactly what equalization flattens.
+	 *
+	 *  Recoverable, but not with an exponent: pow has no inflection, so it can
+	 *  shift mass up or down but cannot gather it toward the middle. That needs
+	 *  an S-curve. smoothstep(0, 1, v) in the material re-clusters toward the
+	 *  centre, and applied twice approaches Gaussian. The advantage of doing it
+	 *  that way is that the same S-curve then means the same thing on every
+	 *  channel. */
+	Equalize = 2	UMETA(DisplayName = "Equalize"),
+};
+
+namespace NoiseBakeConstants
+{
+	/** Bins in the distribution probe histogram. Only needs to resolve a median
+	 *  and a smooth CDF, both of which are far coarser than this. */
+	static constexpr int32 HistogramBins = 1024;
+
+	/** Samples in the per-channel equalization LUT uploaded to the shader.
+	 *  A CDF is monotone and smooth, so linear interpolation between 64 points
+	 *  is well past sufficient. */
+	static constexpr int32 EqualizationLutSize = 64;
+}
 
 /** How a channel's raw FBM output gets mapped into [0,1] before quantization. */
 UENUM(BlueprintType)
@@ -32,17 +145,27 @@ enum class ENoiseNormalizeMode : uint8
 	/** Bake a low-resolution probe pass first, take the observed min/max, pad
 	 *  slightly, and use that. Correct in almost every case and costs ~1% of the
 	 *  bake. This is what you want unless you have a reason otherwise. */
-	AutoProbe	= 0	UMETA(DisplayName = "Auto (Probe Pass)"),
+	AutoProbe = 0	UMETA(DisplayName = "Auto (Probe Pass)"),
+
+	/** Probe, then normalize about zero using a single magnitude
+	 *  M = max(|min|, |max|), giving the range [-M, M].
+	 *
+	 *  Required for any channel whose sign is meaningful. Plain AutoProbe maps
+	 *  the observed min to 0 and max to 1, which moves the zero crossing to
+	 *  wherever the probe happened to land. For a vector component that is not a
+	 *  cosmetic difference: it introduces a constant offset, so a field that
+	 *  should integrate to zero net displacement acquires a drift. */
+	AutoProbeSymmetric = 3	UMETA(DisplayName = "Auto (Symmetric About Zero)"),
 
 	/** Use ManualMin/ManualMax. Use this when two channels must share an
 	 *  identical range, or when you are re-baking at a new resolution and need
 	 *  byte-for-byte comparable output to a previous bake. */
-	Manual		= 1	UMETA(DisplayName = "Manual Range"),
+	Manual = 1	UMETA(DisplayName = "Manual Range"),
 
 	/** Emit the raw FBM value clamped to [0,1]. The basis functions already
 	 *  return [0,1], so this is only lossy for ridged/multi-octave setups that
 	 *  do not reach the full range. */
-	None		= 2	UMETA(DisplayName = "None"),
+	None = 2	UMETA(DisplayName = "None"),
 };
 
 /** Per-channel noise definition. Each of the four output channels carries an
@@ -57,14 +180,14 @@ struct NOISEBAKER_API FNoiseChannelRecipe
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Basis")
 	ENoiseBasis Basis = ENoiseBasis::Perlin;
 
-	/** Lattice cells across the tile at octave 0. This is the tiling period:
-	 *  the baked texture repeats exactly every BasePeriod cells, so a value of 4
-	 *  means the first octave completes 4 times across the volume.
+	/** Lattice cells across the tile at octave 0, and therefore the tiling
+	 *  period: the baked texture repeats exactly every BasePeriod cells.
 	 *
-	 *  Larger values give finer base features and a less obviously repeating
-	 *  texture, at the cost of Nyquist headroom for the higher octaves. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Basis", meta = (ClampMin = "1", UIMin = "1", UIMax = "32"))
-	int32 BasePeriod = 4;
+	 *  Larger values give finer base features and more unique content before the
+	 *  repeat becomes readable, at the cost of Nyquist headroom for the higher
+	 *  octaves. See GetMaxOctaves. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Basis")
+	ENoiseBasePeriod BasePeriod = ENoiseBasePeriod::P4;
 
 	/** Number of FBM octaves. Each octave multiplies the period by Lacunarity,
 	 *  so octave count is bounded by resolution (see the Nyquist rule in
@@ -106,18 +229,61 @@ struct NOISEBAKER_API FNoiseChannelRecipe
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shaping")
 	bool bInvert = false;
 
-	/** Output range the normalized [0,1] signal is rescaled into. Narrowing this
-	 *  is how you give a channel headroom or a floor without touching the
-	 *  material. */
+	/** Redistribution applied after normalization and before the output remap.
+	 *  See ENoiseDistributionMode. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shaping")
+	ENoiseDistributionMode DistributionMode = ENoiseDistributionMode::None;
+
+	/** Output range within the unit interval, applied after redistribution.
+	 *  Narrowing it gives the channel headroom or a floor without touching the
+	 *  material.
+	 *
+	 *  Stays in [0,1] even for a bipolar channel; polarity is applied after this
+	 *  as a final conversion, so [0, 0.75] with bBipolarOutput gives a final
+	 *  range of [-1, 0.5]. Any range within [-1,1], symmetric or not, is
+	 *  reachable that way, and keeping this stage unipolar means the remap and
+	 *  the polarity switch never disagree about what the range means. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shaping", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float OutputMin = 0.0f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shaping", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float OutputMax = 1.0f;
 
+	/** Emit [-1,1] instead of [0,1]. Applied last, as v * 2 - 1.
+	 *
+	 *  On BGRA8 the value is bias-encoded straight back into the unsigned
+	 *  texture, so the stored bytes are identical to the unipolar case; what
+	 *  changes is the DecodeScale/DecodeBias recorded for the consumer. On
+	 *  RGBA16F the negative values are stored directly. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shaping")
+	bool bBipolarOutput = false;
+
+	/** True when the final value can go below zero, which is what triggers bias
+	 *  encoding on an unsigned storage format. */
+	bool IsSigned() const
+	{
+		return bBipolarOutput;
+	}
+
 	/** See ENoiseNormalizeMode. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Normalization")
 	ENoiseNormalizeMode NormalizeMode = ENoiseNormalizeMode::AutoProbe;
+
+	/** Channels sharing a non-zero group id are normalized together: the probe
+	 *  ranges are merged and one scale and bias is applied across all of them.
+	 *  0 means normalize independently.
+	 *
+	 *  This exists for vector-valued output. Normalizing the components of a
+	 *  vector independently rescales each axis by a different factor, which
+	 *  rotates and skews every vector in the field. The result still looks like
+	 *  plausible noise, which is what makes it dangerous: nothing about the
+	 *  preview says the directions are wrong.
+	 *
+	 *  For a curl or warp field, put R, G and B in group 1 and leave A at 0.
+	 *  Group members should also share a normalize mode; mixing Symmetric and
+	 *  AutoProbe within a group defeats the purpose. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Normalization", meta = (ClampMin = "0", ClampMax = "3"))
+	int32 NormalizationGroup = 0;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Normalization", meta = (EditCondition = "NormalizeMode == ENoiseNormalizeMode::Manual", EditConditionHides))
 	float ManualMin = 0.0f;
@@ -125,11 +291,17 @@ struct NOISEBAKER_API FNoiseChannelRecipe
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Normalization", meta = (EditCondition = "NormalizeMode == ENoiseNormalizeMode::Manual", EditConditionHides))
 	float ManualMax = 1.0f;
 
+	/** BasePeriod as a plain integer. */
+	int32 GetBasePeriod() const
+	{
+		return FMath::Max((int32)BasePeriod, 1);
+	}
+
 	/** Lattice cells across the tile at the finest octave. This is the number
 	 *  that governs aliasing. */
 	int32 GetFinestPeriod() const
 	{
-		int32 Period = FMath::Max(BasePeriod, 1);
+		int32 Period = GetBasePeriod();
 		for (int32 i = 1; i < FMath::Max(Octaves, 1); ++i)
 		{
 			Period *= FMath::Max(Lacunarity, 2);
@@ -138,14 +310,23 @@ struct NOISEBAKER_API FNoiseChannelRecipe
 	}
 };
 
-/** Per-channel normalization actually applied during a bake, recorded so the
- *  material (or any consumer) can recover the pre-normalization value:
+/** Per-channel normalization and encoding actually applied during a bake.
  *
- *      Raw = (Stored - Bias) / Scale
+ *  Two separate transforms are recorded, and the distinction matters.
  *
- *  Without this a re-bake at a different resolution silently shifts every
- *  threshold downstream, because the probe pass will observe a slightly
- *  different min/max. */
+ *  Normalization maps the raw FBM output into [0,1] before the output range is
+ *  applied. Recording it means a re-bake at a different resolution, which will
+ *  observe a slightly different probe range, does not silently shift every
+ *  threshold downstream.
+ *
+ *  Encoding is what makes a signed value fit an unsigned storage format. The
+ *  consumer recovers the field value with a single uniform rule regardless of
+ *  format or sign:
+ *
+ *      Value = Stored * DecodeScale + DecodeBias
+ *
+ *  which is (1, 0) for unsigned BGRA8 and for all RGBA16F, and (2, -1) for a
+ *  signed channel in BGRA8. */
 USTRUCT(BlueprintType)
 struct NOISEBAKER_API FNoiseChannelNormalization
 {
@@ -162,13 +343,56 @@ struct NOISEBAKER_API FNoiseChannelNormalization
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Normalization")
 	float Bias = 0.0f;
+
+	/** Applied on write: Stored = Value * EncodeScale + EncodeBias. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Encoding")
+	float EncodeScale = 1.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Encoding")
+	float EncodeBias = 0.0f;
+
+	/** Inverse of the above, for the material. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Encoding")
+	float DecodeScale = 1.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Encoding")
+	float DecodeBias = 0.0f;
+
+	/** Redistribution actually applied. Recorded because it is baked in and
+	 *  irreversible from the texture alone: two visually similar textures can
+	 *  respond very differently to the same exponent if one was equalized. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Distribution")
+	ENoiseDistributionMode DistributionMode = ENoiseDistributionMode::None;
+
+	/** Exponent used by CenterMedian, or 1 otherwise. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Distribution")
+	float DistributionGamma = 1.0f;
+
+	/** Median of the normalized distribution as measured by the probe, before
+	 *  any redistribution. 0.5 means the channel was already centred. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Distribution")
+	float ObservedMedian = 0.5f;
+
+	/** True when the channel emits [-1,1]. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Encoding")
+	bool bBipolar = false;
+
+	/** Group this channel was normalized with, echoed from the recipe. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Normalization")
+	int32 NormalizationGroup = 0;
 };
 
 /** Conservative per-brick bounds over the baked volume, one min/max pair per
- *  channel per brick, stored as bytes in the same 0-255 space as the texture.
+ *  channel per brick.
  *
- *  Layout: BrickData[((z * BrickDim.Y + y) * BrickDim.X + x) * 8 + i], where
- *  i in [0,4) is the per-channel min in RGBA order and i in [4,8) is the max.
+ *  Stored as floats in DECODED field space, not raw storage bytes. That means
+ *  the bounds carry sign for a signed channel, and they stay meaningful when
+ *  the output format changes. Layout:
+ *
+ *      BrickMinMax[(((z * Dim.Y + y) * Dim.X + x) * 8) + i]
+ *
+ *  with i in [0,4) the per-channel minimum in RGBA order and i in [4,8) the
+ *  maximum.
  *
  *  For a raymarcher the min/max lets you bound the composed field over a brick
  *  without sampling it. Because the large-scale structure here is analytic, the
@@ -193,11 +417,14 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Bake")
 	int32 Resolution = 0;
 
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Bake")
+	ENoiseOutputFormat OutputFormat = ENoiseOutputFormat::BGRA8;
+
 	/** Tiling period per channel, in lattice cells across the volume. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Bake")
 	TArray<int32> ChannelBasePeriods;
 
-	/** Normalization applied per channel, in RGBA order. */
+	/** Normalization and encoding applied per channel, in RGBA order. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Bake")
 	TArray<FNoiseChannelNormalization> ChannelNormalization;
 
@@ -208,9 +435,9 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Acceleration")
 	FIntVector BrickDimensions = FIntVector::ZeroValue;
 
-	/** 8 bytes per brick: RGBA min then RGBA max. */
+	/** 8 floats per brick: RGBA min then RGBA max, in decoded field space. */
 	UPROPERTY()
-	TArray<uint8> BrickMinMax;
+	TArray<float> BrickMinMax;
 };
 
 /** Shared validation, used by both the recipe's editor-time checks and the
@@ -221,6 +448,11 @@ namespace NoiseBakeValidation
 	 *  top octave aliases into hash noise, and it will not survive mip
 	 *  generation either. */
 	static constexpr int32 MinVoxelsPerFinestCell = 4;
+
+	/** Highest octave count that satisfies the Nyquist rule for the given
+	 *  resolution, base period and lacunarity. Returns 0 when the base period
+	 *  alone already violates it, in which case no octave count validates. */
+	NOISEBAKER_API int32 GetMaxOctaves(int32 Resolution, int32 BasePeriod, int32 Lacunarity);
 
 	/** Returns true if the channel is bakeable at the given resolution.
 	 *  OutError is filled with a human-readable reason when it is not. */

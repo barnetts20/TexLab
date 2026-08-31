@@ -6,6 +6,14 @@
 class UNoiseBakeRecipe;
 class UVolumeTexture;
 
+/** Stages of the shaping chain to run. Mirrors NVB_STAGE_* in NoiseBakeCS.usf. */
+enum class ENoiseShapeStage : int32
+{
+	Raw = 0,
+	Normalized = 1,
+	Full = 2,
+};
+
 /** Flat parameter block handed to the render thread. Deliberately plain so it
  *  can be captured by value into a render command without touching UObjects
  *  from a non-game thread. */
@@ -13,13 +21,15 @@ struct FNoiseBakeDispatchParams
 {
 	int32 Resolution = 0;
 	int32 Supersample = 1;
-	bool bApplyNormalize = true;
+	ENoiseShapeStage ShapeStage = ENoiseShapeStage::Full;
 	FVector3f DomainOffset = FVector3f::ZeroVector;
 
 	FVector4f ChannelParamsA[4];
 	FIntVector4 ChannelParamsB[4];
 	FIntVector4 ChannelParamsC[4];
 	FVector4f ChannelNorm[4];
+	FVector4f ChannelShaping[4];
+	FVector4f ChannelEqLut[64];
 };
 
 /** Drives a full bake: validate, probe, dispatch, read back, quantize, build
@@ -64,6 +74,7 @@ private:
 		int32 Resolution,
 		int32 SliceOffset,
 		int32 SliceCount,
+		ENoiseOutputFormat Format,
 		bool bDither,
 		TArray<uint8>& OutTexels);
 
@@ -71,8 +82,10 @@ private:
 		const TArray<uint8>& Texels,
 		int32 Resolution,
 		int32 BrickSize,
+		ENoiseOutputFormat Format,
+		const TArray<FNoiseChannelNormalization>& Normalization,
 		FIntVector& OutDimensions,
-		TArray<uint8>& OutBrickMinMax);
+		TArray<float>& OutBrickMinMax);
 
 	static UVolumeTexture* ResolveOrCreateTexture(UNoiseBakeRecipe& Recipe, FString& OutError);
 
@@ -82,6 +95,6 @@ private:
 		const TArray<uint8>& Texels,
 		const TArray<FNoiseChannelNormalization>& Normalization,
 		const FIntVector& BrickDimensions,
-		const TArray<uint8>& BrickMinMax,
+		const TArray<float>& BrickMinMax,
 		FString& OutError);
 };
