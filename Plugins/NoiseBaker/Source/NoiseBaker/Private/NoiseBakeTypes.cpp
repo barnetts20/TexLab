@@ -93,15 +93,6 @@ namespace NoiseBakeValidation
 			return false;
 		}
 
-		if (Channel.OutputMax < Channel.OutputMin)
-		{
-			OutError = FString::Printf(
-				TEXT("%s: OutputMax (%.3f) is below OutputMin (%.3f). Use bInvert to flip the channel ")
-				TEXT("rather than crossing the output range."),
-				ChannelName, Channel.OutputMax, Channel.OutputMin);
-			return false;
-		}
-
 		if (Channel.IsSigned() && Channel.NormalizeMode == ENoiseNormalizeMode::AutoProbe)
 		{
 			OutError = FString::Printf(
@@ -111,17 +102,6 @@ namespace NoiseBakeValidation
 				TEXT("Auto (Symmetric About Zero) for any channel whose sign is meaningful."),
 				ChannelName);
 			return false;
-		}
-
-		if (Channel.bBipolarOutput && Channel.DistributionMode != ENoiseDistributionMode::None)
-		{
-			// Redistribution centres on 0.5 in unipolar space, which maps to 0
-			// after the polarity conversion. That is usually what you want, so
-			// this is a note rather than an error, but the two features interact
-			// and it is worth saying so out loud.
-			UE_LOG(LogTemp, Log,
-				TEXT("NoiseBaker: %s combines bipolar output with redistribution; the redistributed ")
-				TEXT("median at 0.5 becomes the zero crossing."), ChannelName);
 		}
 
 		if (Channel.NormalizeMode == ENoiseNormalizeMode::Manual &&

@@ -34,7 +34,7 @@ int ShapeStage;
  *  period exactly 1.0 in UVW, the two must agree. */
 float3 DomainOffset;
 
-// Gain, OutputMin, OutputMax, WorleyJitter
+// Gain, WorleyJitter, unused, unused
 float4 ChannelParamsA[4];
 
 // Basis, BasePeriod, Octaves, Lacunarity
@@ -72,7 +72,7 @@ float EvalChannelRaw(int ChannelIndex, float3 UVW)
 		/* Lacunarity */ B.w,
 		/* Gain       */ A.x,
 		/* Seed       */ (uint) C.x,
-		/* Jitter     */ A.w,
+		/* Jitter     */ A.y,
 		/* bRidged    */ bRidged);
 }
 
@@ -129,22 +129,24 @@ float ApplyDistribution(int ChannelIndex, float V)
     return V;
 }
 
-/** The full shaping chain, in order. Each step depends on the previous one
- *  having put the value in a known space, so the order is not arbitrary:
+/** The shaping chain, in order:
  *
- *    normalize    raw FBM -> [0,1], so everything downstream has a fixed domain
- *    redistribute [0,1] -> [0,1], monotone, so OutputMin/Max still mean what
- *                 they say and no feature moves
- *    remap        -> [OutputMin, OutputMax], both within the unit interval
- *    invert       reflect about the range midpoint, NOT 1 - v; on a narrowed
- *                 range the latter would flip the sign and shift the field
+ *    normalize    raw FBM -> [0,1], a fixed domain for everything downstream
+ *    redistribute [0,1] -> [0,1], monotone, so no feature moves
  *    polarity     -> [-1,1] via v * 2 - 1, or identity
  *    encode       fit a signed value into an unsigned storage format
- */
+ *
+ *  There is deliberately no output range remap and no inversion here. Both are
+ *  post-sum scalar maps on the finished value, so a consumer reproduces either
+ *  with a single multiply-add at the sample site. Baking a narrowed range would
+ *  additionally be lossy: [0, 0.5] on BGRA8 spends 128 of 256 levels on
+ *  something a multiply does for free.
+ *
+ *  Redistribution stays despite also acting on the finished value, because
+ *  Equalize needs the CDF of the whole volume and a consumer sampling one texel
+ *  does not have it. */
 float ShapeChannel(int ChannelIndex, float Raw)
 {
-    const float4 A = ChannelParamsA[ChannelIndex];
-    const int4 C = ChannelParamsC[ChannelIndex];
     const float4 N = ChannelNorm[ChannelIndex];
     const float4 S = ChannelShaping[ChannelIndex];
 
@@ -156,13 +158,6 @@ float ShapeChannel(int ChannelIndex, float Raw)
     }
 
     V = ApplyDistribution(ChannelIndex, V);
-
-    V = lerp(A.y, A.z, V);
-
-    if ((C.y & PN_FLAG_INVERT) != 0)
-    {
-        V = (A.y + A.z) - V;
-    }
 
     V = V * S.y + S.z;
 

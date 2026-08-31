@@ -40,7 +40,14 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output", meta = (ClampMin = "1", ClampMax = "4"))
 	int32 Supersample = 1;
 
-	/** Adds sub-LSB triangular dither before quantizing to 8 bits.
+	/** Storage format. BGRA8 for density and detail; RGBA16F when any channel
+	 *  is signed and precision matters, which is the usual case for curl and
+	 *  warp volumes. See ENoiseOutputFormat. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output")
+	ENoiseOutputFormat OutputFormat = ENoiseOutputFormat::BGRA8;
+
+	/** Adds sub-LSB triangular dither before quantizing to 8 bits. Ignored for
+	 *  RGBA16F, which has no uniform quantization step to dither against.
 	 *
 	 *  Worth having on for anything a raymarcher integrates through, where
 	 *  8-bit banding shows up as visible shells. Turn it off if a consumer
@@ -55,17 +62,23 @@ public:
 	bool bGenerateMips = true;
 
 	// -- Channels -----------------------------------------------------------
+	//
+	// ShowOnlyInnerProperties splices each struct's members directly into its
+	// category, dropping the struct property's own header row. Without it the
+	// panel nests three deep -- Channels > R > Red Channel > properties -- and
+	// the middle row carries no information the category name does not already
+	// give you.
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Channels|R")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Channels|R", meta = (ShowOnlyInnerProperties))
 	FNoiseChannelRecipe RedChannel;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Channels|G")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Channels|G", meta = (ShowOnlyInnerProperties))
 	FNoiseChannelRecipe GreenChannel;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Channels|B")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Channels|B", meta = (ShowOnlyInnerProperties))
 	FNoiseChannelRecipe BlueChannel;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Channels|A")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Channels|A", meta = (ShowOnlyInnerProperties))
 	FNoiseChannelRecipe AlphaChannel;
 
 	// -- Acceleration -------------------------------------------------------

@@ -25,7 +25,6 @@ namespace NoiseBakeInternal
 {
 	/** Mirrors PN_FLAG_* in PeriodicNoise.ush. */
 	static constexpr int32 FlagRidged = 1 << 0;
-	static constexpr int32 FlagInvert = 1 << 1;
 
 	/** Readback budget per slab. Keeps peak host and device allocation bounded
 	 *  regardless of volume resolution. */
@@ -104,7 +103,7 @@ void FNoiseVolumeBaker::BuildDispatchParams(const UNoiseBakeRecipe& Recipe, FNoi
 	{
 		const FNoiseChannelRecipe& C = Channels[Index];
 
-		OutParams.ChannelParamsA[Index] = FVector4f(C.Gain, C.OutputMin, C.OutputMax, C.WorleyJitter);
+		OutParams.ChannelParamsA[Index] = FVector4f(C.Gain, C.WorleyJitter, 0.0f, 0.0f);
 
 		OutParams.ChannelParamsB[Index] = FIntVector4(
 			(int32)C.Basis,
@@ -112,9 +111,7 @@ void FNoiseVolumeBaker::BuildDispatchParams(const UNoiseBakeRecipe& Recipe, FNoi
 			FMath::Max(C.Octaves, 1),
 			FMath::Max(C.Lacunarity, 2));
 
-		int32 Flags = 0;
-		Flags |= C.bRidged ? NoiseBakeInternal::FlagRidged : 0;
-		Flags |= C.bInvert ? NoiseBakeInternal::FlagInvert : 0;
+		const int32 Flags = C.bRidged ? NoiseBakeInternal::FlagRidged : 0;
 
 		OutParams.ChannelParamsC[Index] = FIntVector4(C.Seed, Flags, (int32)C.DistributionMode, 0);
 

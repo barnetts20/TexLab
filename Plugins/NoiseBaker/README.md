@@ -100,15 +100,25 @@ Equalize is the one that makes exponents fully portable, at the cost of the clus
 
 Measured by a second probe pass at the Normalized stage, after ranges are settled. Adds ~1% to bake time. The applied mode, gamma and observed median are recorded in `UNoiseBakeAssetUserData`, since redistribution is baked in and not detectable from the texture afterwards.
 
+## What gets baked, and what doesn't
+
+**Anything applied inside the octave loop must be baked. Anything applied to the finished value can be deferred to the consumer.**
+
+Ridged folds each octave before summing, so it cannot be reconstructed from the finished FBM — it's baked. Domain warp and curl will be the same. But an output range remap and an inversion are both post-sum scalar maps, so a consumer reproduces either with one multiply-add at the sample site. Neither exists here.
+
+Range narrowing isn't just redundant, it's lossy: baking `[0, 0.5]` into BGRA8 spends 128 of 256 levels achieving what a multiply does for free. Channels always occupy the full unit interval.
+
+Distribution mode is the exception that proves the rule. It acts on the finished value, but Equalize needs the CDF of the entire volume, and a consumer sampling one texel doesn't have it.
+
 ## Bipolar output
 
-`bBipolarOutput` emits [-1,1] instead of [0,1], applied last as `v * 2 - 1`.
+`bBipolarOutput` emits [-1,1] instead of [0,1], applied last as `v * 2 - 1`. It's the only range control, and it earns its place by changing the **decode contract** rather than the value: on BGRA8 the stored bytes are identical to the unipolar case, and what differs is the recorded `DecodeScale`/`DecodeBias`. On RGBA16F negatives are stored directly.
 
-`OutputMin`/`OutputMax` stay within the unit interval and are applied *before* the conversion, so `[0, 0.75]` bipolar gives a final range of `[-1, 0.5]`. Any range within [-1,1], symmetric or not, is reachable — and keeping the remap stage unipolar means it and the polarity switch can never disagree about what the range means.
-
-On BGRA8 the value is bias-encoded straight back into the unsigned texture, so the stored bytes are identical to the unipolar case; what changes is the recorded decode. On RGBA16F negatives are stored directly. Either way the consumer uses one rule: `Value = Stored * DecodeScale + DecodeBias`.
+Consumers use one rule either way: `Value = Stored * DecodeScale + DecodeBias`.
 
 A bipolar channel must use **Auto (Symmetric About Zero)**; validation rejects plain Auto, which would put the zero crossing wherever the probe landed.
+
+Asymmetric signed ranges, floors, and headroom all belong at the sample site — `v * (max - min) + min` is one instruction and costs no precision.
 
 ## Signed output
 

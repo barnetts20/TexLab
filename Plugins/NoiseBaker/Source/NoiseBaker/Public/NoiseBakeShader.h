@@ -30,7 +30,7 @@ public:
 		SHADER_PARAMETER(int32, ShapeStage)
 		SHADER_PARAMETER(FVector3f, DomainOffset)
 
-		/** x: Gain, y: OutputMin, z: OutputMax, w: WorleyJitter */
+		/** x: Gain, y: WorleyJitter, z/w: unused */
 		SHADER_PARAMETER_ARRAY(FVector4f, ChannelParamsA, [4])
 
 		/** x: Basis, y: BasePeriod, z: Octaves, w: Lacunarity */

@@ -45,6 +45,13 @@ enum class ENoiseBasis : uint8
 UENUM(BlueprintType)
 enum class ENoiseBasePeriod : uint8
 {
+	/** Never selected. Exists only because UnrealHeaderTool requires every
+	 *  UENUM to have a zero entry, for the default-initialized case. The
+	 *  enumerator values here are the periods themselves, which starts at 1, so
+	 *  the zero slot has no meaningful period to name. GetBasePeriod maps it to
+	 *  1 rather than returning zero and producing a division by zero downstream. */
+	Invalid = 0		UMETA(Hidden),
+
 	P1 = 1		UMETA(DisplayName = "1 (whole tile)"),
 	P2 = 2		UMETA(DisplayName = "2"),
 	P4 = 4		UMETA(DisplayName = "4"),
@@ -221,40 +228,33 @@ struct NOISEBAKER_API FNoiseChannelRecipe
 	float WorleyJitter = 1.0f;
 
 	/** Fold each octave around its midpoint before summing, producing sharp
-	 *  creases instead of smooth undulation. */
+	 *  creases instead of smooth undulation.
+	 *
+	 *  Baked because it applies INSIDE the octave loop. Once the octaves are
+	 *  summed there is no way to recover it, which is the test for whether an
+	 *  operation belongs here at all: anything applied per-octave must be baked,
+	 *  anything applied to the finished value can be deferred to the consumer. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shaping")
 	bool bRidged = false;
 
-	/** Flip the final value. Applied last, after normalization and remap. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shaping")
-	bool bInvert = false;
-
-	/** Redistribution applied after normalization and before the output remap.
-	 *  See ENoiseDistributionMode. */
+	/** Redistribution applied after normalization. See ENoiseDistributionMode.
+	 *
+	 *  Baked despite operating on the finished value, because Equalize needs the
+	 *  CDF of the entire volume and a consumer sampling one texel does not have
+	 *  it. This is the exception that proves the rule. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shaping")
 	ENoiseDistributionMode DistributionMode = ENoiseDistributionMode::None;
 
-	/** Output range within the unit interval, applied after redistribution.
-	 *  Narrowing it gives the channel headroom or a floor without touching the
-	 *  material.
+	/** Emit [-1,1] instead of [0,1], applied last as v * 2 - 1.
 	 *
-	 *  Stays in [0,1] even for a bipolar channel; polarity is applied after this
-	 *  as a final conversion, so [0, 0.75] with bBipolarOutput gives a final
-	 *  range of [-1, 0.5]. Any range within [-1,1], symmetric or not, is
-	 *  reachable that way, and keeping this stage unipolar means the remap and
-	 *  the polarity switch never disagree about what the range means. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shaping", meta = (ClampMin = "0.0", ClampMax = "1.0"))
-	float OutputMin = 0.0f;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shaping", meta = (ClampMin = "0.0", ClampMax = "1.0"))
-	float OutputMax = 1.0f;
-
-	/** Emit [-1,1] instead of [0,1]. Applied last, as v * 2 - 1.
+	 *  The only range control. Channels always occupy the full unit interval
+	 *  otherwise, because a narrowed output range would spend storage levels on
+	 *  something a multiply at the sample site does for free: baking [0, 0.5]
+	 *  into BGRA8 uses 128 of 256 levels and throws away a bit for no gain.
 	 *
-	 *  On BGRA8 the value is bias-encoded straight back into the unsigned
-	 *  texture, so the stored bytes are identical to the unipolar case; what
-	 *  changes is the DecodeScale/DecodeBias recorded for the consumer. On
-	 *  RGBA16F the negative values are stored directly. */
+	 *  This one earns its place because it changes the DECODE CONTRACT rather
+	 *  than just the value. The stored bytes on BGRA8 are identical either way;
+	 *  what differs is the DecodeScale/DecodeBias recorded for the consumer. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shaping")
 	bool bBipolarOutput = false;
 
