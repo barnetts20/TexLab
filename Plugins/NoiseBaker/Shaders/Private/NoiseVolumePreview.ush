@@ -1,0 +1,316 @@
+#pragma once
+
+// ---------------------------------------------------------------------------
+// Preview raymarcher for packed volume noise.
+//
+// Adapted from the galaxy density marcher. The stepping rule is carried over
+// unchanged, because it was the right answer there for a reason that still
+// applies: cost you can SET rather than DISCOVER. Two things did change.
+//
+// 1. BOX, NOT SPHERE.
+//    The galaxy marcher intersected a unit sphere because the field was
+//    sphere-bounded. A tiling volume's domain is a cube, and the seams this
+//    tool exists to find sit exactly on its faces. A sphere would tangent the
+//    faces and never cross the corners, which is where a broken wrap is worst.
+//
+// 2. PER-CHANNEL ACCUMULATION.
+//    Four independent transmittances and four independent emissions, marched
+//    together. The channels are separate density fields that happen to share a
+//    texture, so compositing them into one scalar before integrating would
+//    destroy exactly the information you are previewing. One march, four
+//    answers; the alternative is four marches with identical intersection and
+//    stepping work.
+//
+// SAMPLING IS ALWAYS MIP 0 (SampleLevel, not Sample). A raymarch loop has no
+// usable screen-space derivatives, so a plain Sample inside the loop picks a
+// mip from garbage gradients and produces view-dependent mush. It also would
+// defeat the purpose: you cannot validate a tiling seam through a filtered mip.
+//
+// THE SAMPLER MUST BE SET TO WRAP ON ALL THREE AXES. Everything below assumes
+// it. With Clamp, TileCount > 1 shows you the edge voxel smeared across the
+// repeat instead of the neighbouring tile, which looks like a catastrophic
+// seam and is not one.
+// ---------------------------------------------------------------------------
+
+#define NVP_OUTPUT_CHANNELS_RGBA   0
+#define NVP_OUTPUT_SINGLE_CHANNEL  1
+#define NVP_OUTPUT_STEP_HEAT       2
+#define NVP_OUTPUT_COMPOSITE       3
+#define NVP_OUTPUT_TRANSMITTANCE   4
+
+float NVP_Max3(float3 V) { return max(V.x, max(V.y, V.z)); }
+float NVP_Min3(float3 V) { return min(V.x, min(V.y, V.z)); }
+
+/** Reciprocal that survives an axis-aligned ray.
+ *
+ *  A ray exactly parallel to a slab gives dir component 0. Plain 1/0 is +inf,
+ *  which the slab test actually handles correctly, right up until the origin
+ *  sits exactly on the face and produces 0 * inf = NaN. Nudging the divisor is
+ *  cheaper than branching and the bias is far below a voxel. */
+float3 NVP_SafeRcp(float3 V)
+{
+    const float Epsilon = 1e-6;
+    float3 Safe = sign(V) * max(abs(V), Epsilon);
+    Safe += (abs(V) < Epsilon) * Epsilon; // sign(0) == 0, so seed it
+    return 1.0 / Safe;
+}
+
+/** Power that tolerates a zero base. */
+float4 NVP_PowSafe(float4 Base, float4 Exponent)
+{
+    return pow(max(Base, 1e-6), Exponent);
+}
+
+/** Local box position in [-1,1] to texture UVW.
+ *
+ *  TileCount is the whole point of this function. At 1 you see a single copy of
+ *  the volume; at 2 or 3 you see the volume repeated, and any failure of the
+ *  periodic lattice shows up as a discontinuity on the interior faces between
+ *  copies. DomainOffset scrolls the whole field through the box, which is what
+ *  drags those interior faces across the view so you can watch them go past
+ *  rather than having to hunt for them. */
+float3 NVP_BoxToUVW(float3 LocalPos, float3 TileCount, float3 DomainOffset)
+{
+    return (LocalPos * 0.5 + 0.5) * TileCount + DomainOffset;
+}
+
+/** Marches the unit box and accumulates all four channels independently.
+ *
+ *  InViewVec    Local camera vector, surface toward camera. Same convention as
+ *               the galaxy marcher: CameraVector through TransformVector
+ *               [World -> Local]. Direction only; normalization is irrelevant.
+ *
+ *  InCamPosN    Camera position in the box's normalized space, the box spanning
+ *               -1 to 1. This is the ray ORIGIN, not a distance reference, so a
+ *               wrong value moves the ray rather than merely biasing step size.
+ *
+ *  InTileCount  Copies of the volume across the box, per axis. Non-uniform
+ *               values are legal and occasionally useful for isolating which
+ *               axis a seam is on.
+ *
+ *  InDomainOffset  Added to UVW after tiling. Drive from Time for a scroll.
+ *
+ *  InDensityScale  Per-channel extinction multiplier. Zero hides a channel.
+ *  InPower         Per-channel shaping exponent. 1 is off.
+ *
+ *  InStepBudget    See the note below; this is a budget, not a count.
+ *  InStepGrowth    Step growth across the marched span.
+ *  InMaxSteps      Safety bound. Set to int(StepBudget) + 8.
+ *  InJitter        Per-pixel value in (0,1] scaling the FIRST step only.
+ *  InVoxelsPerAxis Resolution of the baked volume, used to derive the step
+ *                  floor. Passing 0 disables the floor.
+ *
+ *  Returns per-channel accumulated emission in RGBA. OutSteps and
+ *  OutTransmittance come back through the Custom node's Additional Outputs. */
+float4 NoiseVolumeMarch(
+    Texture3D InTex, SamplerState InSampler,
+    float3 InViewVec, float3 InCamPosN,
+    float3 InTileCount, float3 InDomainOffset,
+    float4 InDensityScale, float4 InPower,
+    float InStepBudget, float InStepGrowth, int InMaxSteps,
+    float InJitter, float InVoxelsPerAxis,
+    out float OutSteps, out float4 OutTransmittance)
+{
+    OutSteps = 0.0;
+    OutTransmittance = 1.0;
+
+    float3 o = InCamPosN;
+    float3 dir = normalize(-InViewVec);
+
+    // -- Slab intersection against the unit box -----------------------------
+
+    float3 InvDir = NVP_SafeRcp(dir);
+    float3 T0 = (float3(-1.0, -1.0, -1.0) - o) * InvDir;
+    float3 T1 = (float3( 1.0,  1.0,  1.0) - o) * InvDir;
+
+    float3 TNear = min(T0, T1);
+    float3 TFar  = max(T0, T1);
+
+    float tEnter = NVP_Max3(TNear);
+    float tExit  = NVP_Min3(TFar);
+
+    // Behind the camera. Real case, not an impossible one: the preview proxy is
+    // drawn with inverted normals so its far face can rasterize while the box
+    // itself is behind the viewer.
+    if (tExit <= 0.0)
+    {
+        return 0.0;
+    }
+
+    // Camera inside the box falls out of this clamp rather than needing its own
+    // branch, and it matters under a span-relative step rule: without the trim,
+    // the stretch behind the viewer would be budgeted as if it were visible,
+    // spending steps on nothing AND coarsening everything that is visible.
+    float tStart = max(tEnter, 0.0);
+    if (tExit <= tStart)
+    {
+        return 0.0;
+    }
+
+    // -- Step sizing --------------------------------------------------------
+
+    // The trimmed span divided by the budget. Everything else is a modifier on
+    // this. Because the span is trimmed, a camera inside the box budgets across
+    // what remains ahead of it rather than across the full chord.
+    float span = max(tExit - tStart, 1e-6);
+    float baseStep = span / max(InStepBudget, 1.0);
+
+    // Step floor from the field rather than from an authored distance. The box
+    // spans 2 units and holds TileCount copies of a VoxelsPerAxis volume, so one
+    // voxel is 2 / (TileCount * VoxelsPerAxis) units along the ray. Half that is
+    // the Nyquist limit: stepping finer resolves detail the texture does not
+    // contain. A floor can only lengthen a step, so this is pure saving, and it
+    // binds exactly when the budget was set too fine.
+    float MaxTiles = NVP_Max3(max(InTileCount, 1e-3));
+    float voxelStep = (InVoxelsPerAxis > 0.0)
+        ? (2.0 / (MaxTiles * InVoxelsPerAxis)) * 0.5
+        : 0.0;
+    float minStep = max(voxelStep, 1e-5);
+
+    float growth = max(InStepGrowth, 0.0);
+    float invSpan = 1.0 / span;
+
+    // Shortens the first step only, offsetting each pixel's lattice so the
+    // sampling grid does not read as banding. Costs no energy: the final step
+    // clamps to the exit, so total path length is unchanged.
+    float firstScale = clamp(InJitter, 0.05, 1.0);
+
+    bool bShape = any(InPower != 1.0);
+
+    // -- March --------------------------------------------------------------
+
+    float4 Transmittance = 1.0;
+    float4 Emission = 0.0;
+    float t = tStart;
+    float stepsTaken = 0.0;
+
+    // InMaxSteps is a safety bound, not the step count. StepBudget and growth
+    // set the count between them: it lands at StepBudget * ln(1+g)/g, which is
+    // the budget at growth 0, 0.69 of it at growth 1, 0.55 at growth 2. A bound
+    // far above the budget can never be reached; a bound below it truncates
+    // silently, which looks exactly like a volume that stops halfway.
+    [loop]
+    for (int i = 0; i < InMaxSteps; i++)
+    {
+        float remaining = tExit - t;
+        if (remaining <= 1e-6)
+        {
+            break;
+        }
+
+        // Sized before the sample is taken, because the sample sits at the
+        // midpoint and the midpoint is not known until the length is.
+        //
+        // Growth runs on progress along the span, not distance from the camera,
+        // which is what makes the count independent of where the viewer stands.
+        // t01 is saturated rather than trusted: tStart is clamped forward above,
+        // and anything that put it past tExit would drive the step negative and
+        // hang the march.
+        float t01 = saturate((t - tStart) * invSpan);
+        float stepLen = max(baseStep * (1.0 + growth * t01), minStep);
+        if (i == 0)
+        {
+            stepLen *= firstScale;
+        }
+        stepLen = min(stepLen, remaining);
+
+        stepsTaken += 1.0;
+
+        // Midpoint sample. With uniform steps this only shifts the result half a
+        // step; with steps that grow, sampling at the near edge weights every
+        // interval by its own leading face and biases the integral toward the
+        // camera, worse the faster the steps grow.
+        float3 LocalPos = o + dir * (t + stepLen * 0.5);
+        float3 UVW = NVP_BoxToUVW(LocalPos, InTileCount, InDomainOffset);
+
+        // SampleLevel, not Sample. See the header note.
+        float4 Density = InTex.SampleLevel(InSampler, UVW, 0);
+
+        if (bShape)
+        {
+            Density = NVP_PowSafe(Density, InPower);
+        }
+
+        // Four independent Beer-Lambert integrations sharing one step.
+        float4 Alpha = 1.0 - exp(-Density * InDensityScale * stepLen);
+
+        Emission += Alpha * Transmittance;
+        Transmittance *= 1.0 - Alpha;
+
+        // Every channel has to be saturated before the march can stop. Bailing
+        // on the first one to reach opacity would truncate the others, and a
+        // channel with a low DensityScale is the one you are usually trying to
+        // see through the others.
+        if (all(Transmittance < 0.001))
+        {
+            break;
+        }
+
+        t += stepLen;
+    }
+
+    OutSteps = stepsTaken;
+    OutTransmittance = Transmittance;
+
+    return Emission;
+}
+
+/** Single-output wrapper for a Custom node without Additional Outputs wired.
+ *
+ *  InOutputMode selects what lands in the return value; see the NVP_OUTPUT_*
+ *  defines. The march is identical in every mode, so switching views costs
+ *  nothing and always shows the same integration. */
+float4 NoiseVolumePreview(
+    Texture3D InTex, SamplerState InSampler,
+    float3 InViewVec, float3 InCamPosN,
+    float3 InTileCount, float3 InDomainOffset,
+    float4 InDensityScale, float4 InPower,
+    float InStepBudget, float InStepGrowth, int InMaxSteps,
+    float InJitter, float InVoxelsPerAxis,
+    int InOutputMode, int InChannelSelect)
+{
+    float Steps = 0.0;
+    float4 Transmittance = 1.0;
+
+    float4 Emission = NoiseVolumeMarch(
+        InTex, InSampler, InViewVec, InCamPosN,
+        InTileCount, InDomainOffset,
+        InDensityScale, InPower,
+        InStepBudget, InStepGrowth, InMaxSteps,
+        InJitter, InVoxelsPerAxis,
+        Steps, Transmittance);
+
+    // Coverage of the least transmissive channel, used as alpha in the modes
+    // that need one.
+    float Coverage = 1.0 - NVP_Min3(Transmittance.rgb);
+    Coverage = max(Coverage, 1.0 - Transmittance.a);
+
+    if (InOutputMode == NVP_OUTPUT_SINGLE_CHANNEL)
+    {
+        float V = Emission[clamp(InChannelSelect, 0, 3)];
+        return float4(V, V, V, Coverage);
+    }
+
+    if (InOutputMode == NVP_OUTPUT_STEP_HEAT)
+    {
+        // Raw count normalized only by the bound, so the ramp means something
+        // absolute. Blue below budget, red at it: anything saturating red is
+        // hitting the safety bound and truncating.
+        float H = saturate(Steps / max((float)InMaxSteps, 1.0));
+        return float4(H, 1.0 - abs(H * 2.0 - 1.0), 1.0 - H, 1.0);
+    }
+
+    if (InOutputMode == NVP_OUTPUT_COMPOSITE)
+    {
+        float V = dot(Emission, float4(0.25, 0.25, 0.25, 0.25));
+        return float4(V, V, V, Coverage);
+    }
+
+    if (InOutputMode == NVP_OUTPUT_TRANSMITTANCE)
+    {
+        return Transmittance;
+    }
+
+    // NVP_OUTPUT_CHANNELS_RGBA. The four accumulations, untouched.
+    return Emission;
+}

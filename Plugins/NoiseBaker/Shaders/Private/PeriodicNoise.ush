@@ -1,0 +1,320 @@
+// Periodic noise primitives.
+//
+// Every function here tiles EXACTLY on all three axes. The property comes from
+// one place: the lattice cell index is wrapped modulo the period before it is
+// hashed. Wrapping the input position instead does not work, because the
+// interpolation at x = Period - 0.5 still reaches cell index Period, which
+// hashes differently to cell 0 and leaves a hard discontinuity at the boundary.
+// The wrap has to live inside the hash lookup. Every corner fetch and every
+// Worley neighbour fetch below goes through PN_WrapCell for that reason.
+//
+// Domain convention: callers pass UVW in [0,1) representing position within the
+// tile. PN_FBM multiplies that by the octave's period to get lattice space. A
+// consequence worth stating: the field is periodic with period exactly 1.0 in
+// UVW, so PN_FBM(UVW) == PN_FBM(UVW + 1.0) to floating point precision. The
+// baker's tiling self-test relies on that identity.
+
+#pragma once
+
+#define PN_BASIS_VALUE			0
+#define PN_BASIS_PERLIN			1
+#define PN_BASIS_WORLEY_F1		2
+#define PN_BASIS_WORLEY_F2F1	3
+#define PN_BASIS_PERLIN_WORLEY	4
+
+#define PN_FLAG_RIDGED	(1 << 0)
+#define PN_FLAG_INVERT	(1 << 1)
+
+// ---------------------------------------------------------------------------
+// Cell wrapping and hashing
+// ---------------------------------------------------------------------------
+
+/** Positive modulo of a lattice cell index. HLSL's % truncates toward zero, so
+ *  a negative cell index would produce a negative remainder and hash to a
+ *  different bucket than its positive counterpart. The double-mod fixes that.
+ *  Negative indices do occur: the Worley 3x3x3 search reaches to -1 in the
+ *  first cell of the volume. */
+uint3 PN_WrapCell(int3 Cell, int3 Period)
+{
+	return (uint3)(((Cell % Period) + Period) % Period);
+}
+
+/** PCG3D-style integer hash. Three components in, three out, well mixed in all
+ *  directions. Avalanche quality matters here: a weak hash shows up as visible
+ *  planar correlation in the volume, which is much easier to see in a raymarch
+ *  than in a 2D slice preview. */
+uint3 PN_Hash3(uint3 C, uint Seed)
+{
+	uint3 V = C * 1664525u + 1013904223u;
+	V += Seed * 1013904223u;
+
+	V.x += V.y * V.z;
+	V.y += V.z * V.x;
+	V.z += V.x * V.y;
+
+	V ^= V >> 16u;
+
+	V.x += V.y * V.z;
+	V.y += V.z * V.x;
+	V.z += V.x * V.y;
+
+	return V;
+}
+
+uint PN_Hash(uint3 C, uint Seed)
+{
+	const uint3 V = PN_Hash3(C, Seed);
+	return V.x ^ (V.y << 11u) ^ (V.z << 22u);
+}
+
+/** Scalar hash in [0,1). */
+float PN_Hash01(uint3 C, uint Seed)
+{
+	return (float)(PN_Hash(C, Seed) & 0x00FFFFFFu) * (1.0f / 16777216.0f);
+}
+
+/** Vector hash in [0,1)^3. */
+float3 PN_Hash01_3(uint3 C, uint Seed)
+{
+	const uint3 H = PN_Hash3(C, Seed);
+	return float3(H & 0x00FFFFFFu) * (1.0f / 16777216.0f);
+}
+
+/** Uniformly distributed unit vector, from a single hash. Sampling z uniformly
+ *  in [-1,1] and the azimuth uniformly gives an even distribution over the
+ *  sphere; the naive approach of normalising three uniform components clusters
+ *  toward the cube corners and biases Perlin along the diagonals. */
+float3 PN_Gradient(uint3 C, uint Seed)
+{
+	const uint H = PN_Hash(C, Seed);
+
+	const float Azimuth = (float)(H & 0xFFFFu) * (6.28318530717958647f / 65536.0f);
+	const float Z = (float)((H >> 16u) & 0xFFFFu) * (2.0f / 65535.0f) - 1.0f;
+	const float R = sqrt(max(0.0f, 1.0f - Z * Z));
+
+	return float3(R * cos(Azimuth), R * sin(Azimuth), Z);
+}
+
+/** Quintic fade. Second derivative vanishes at the endpoints, which matters
+ *  because a cubic fade leaves visible creases along cell boundaries once you
+ *  light the isosurface. */
+float3 PN_Fade(float3 T)
+{
+	return T * T * T * (T * (T * 6.0f - 15.0f) + 10.0f);
+}
+
+float PN_Remap(float V, float InLow, float InHigh, float OutLow, float OutHigh)
+{
+	return OutLow + (V - InLow) * (OutHigh - OutLow) / max(InHigh - InLow, 1e-6f);
+}
+
+// ---------------------------------------------------------------------------
+// Basis functions
+//
+// All of these take lattice-space P (already multiplied by Period) and the
+// matching Period, and return a value in [0,1].
+// ---------------------------------------------------------------------------
+
+/** Trilinearly interpolated per-cell random scalar. */
+float PN_Value(float3 P, int3 Period, uint Seed)
+{
+	const int3 C = (int3)floor(P);
+	const float3 F = P - (float3)C;
+	const float3 W = PN_Fade(F);
+
+	const float V000 = PN_Hash01(PN_WrapCell(C + int3(0, 0, 0), Period), Seed);
+	const float V100 = PN_Hash01(PN_WrapCell(C + int3(1, 0, 0), Period), Seed);
+	const float V010 = PN_Hash01(PN_WrapCell(C + int3(0, 1, 0), Period), Seed);
+	const float V110 = PN_Hash01(PN_WrapCell(C + int3(1, 1, 0), Period), Seed);
+	const float V001 = PN_Hash01(PN_WrapCell(C + int3(0, 0, 1), Period), Seed);
+	const float V101 = PN_Hash01(PN_WrapCell(C + int3(1, 0, 1), Period), Seed);
+	const float V011 = PN_Hash01(PN_WrapCell(C + int3(0, 1, 1), Period), Seed);
+	const float V111 = PN_Hash01(PN_WrapCell(C + int3(1, 1, 1), Period), Seed);
+
+	const float X00 = lerp(V000, V100, W.x);
+	const float X10 = lerp(V010, V110, W.x);
+	const float X01 = lerp(V001, V101, W.x);
+	const float X11 = lerp(V011, V111, W.x);
+
+	const float Y0 = lerp(X00, X10, W.y);
+	const float Y1 = lerp(X01, X11, W.y);
+
+	return lerp(Y0, Y1, W.z);
+}
+
+/** Classic gradient noise. Returns roughly [-1,1]; 3D Perlin with unit
+ *  gradients peaks near sqrt(3)/2, so the result is scaled to bring the
+ *  practical maximum to about 1. */
+float PN_Perlin(float3 P, int3 Period, uint Seed)
+{
+	const int3 C = (int3)floor(P);
+	const float3 F = P - (float3)C;
+	const float3 W = PN_Fade(F);
+
+	#define PN_PERLIN_CORNER(ox, oy, oz) \
+		dot(PN_Gradient(PN_WrapCell(C + int3(ox, oy, oz), Period), Seed), F - float3(ox, oy, oz))
+
+	const float G000 = PN_PERLIN_CORNER(0, 0, 0);
+	const float G100 = PN_PERLIN_CORNER(1, 0, 0);
+	const float G010 = PN_PERLIN_CORNER(0, 1, 0);
+	const float G110 = PN_PERLIN_CORNER(1, 1, 0);
+	const float G001 = PN_PERLIN_CORNER(0, 0, 1);
+	const float G101 = PN_PERLIN_CORNER(1, 0, 1);
+	const float G011 = PN_PERLIN_CORNER(0, 1, 1);
+	const float G111 = PN_PERLIN_CORNER(1, 1, 1);
+
+	#undef PN_PERLIN_CORNER
+
+	const float X00 = lerp(G000, G100, W.x);
+	const float X10 = lerp(G010, G110, W.x);
+	const float X01 = lerp(G001, G101, W.x);
+	const float X11 = lerp(G011, G111, W.x);
+
+	const float Y0 = lerp(X00, X10, W.y);
+	const float Y1 = lerp(X01, X11, W.y);
+
+	return lerp(Y0, Y1, W.z) * 1.1547005f; // 2 / sqrt(3)
+}
+
+/** Cellular noise. Returns (F1, F2) as raw distances in cell units.
+ *
+ *  The wrap applies to the hash lookup only: the feature point's POSITION uses
+ *  the unwrapped neighbour offset, so distances stay continuous across the tile
+ *  boundary, while its identity comes from the wrapped cell so the cell on the
+ *  far side of the seam is the same cell. */
+float2 PN_Worley(float3 P, int3 Period, uint Seed, float Jitter)
+{
+	const int3 C = (int3)floor(P);
+	const float3 F = P - (float3)C;
+
+	float F1 = 1e9f;
+	float F2 = 1e9f;
+
+	const float JitterBias = (1.0f - Jitter) * 0.5f;
+
+	[unroll]
+	for (int z = -1; z <= 1; ++z)
+	{
+		[unroll]
+		for (int y = -1; y <= 1; ++y)
+		{
+			[unroll]
+			for (int x = -1; x <= 1; ++x)
+			{
+				const int3 Offset = int3(x, y, z);
+				const float3 Jittered = PN_Hash01_3(PN_WrapCell(C + Offset, Period), Seed) * Jitter + JitterBias;
+				const float3 FeaturePoint = (float3)Offset + Jittered;
+
+				const float D = length(FeaturePoint - F);
+
+				if (D < F1)
+				{
+					F2 = F1;
+					F1 = D;
+				}
+				else if (D < F2)
+				{
+					F2 = D;
+				}
+			}
+		}
+	}
+
+	return float2(F1, F2);
+}
+
+/** Dispatch to a basis by enum, normalised to [0,1]. */
+float PN_SampleBasis(int Basis, float3 P, int3 Period, uint Seed, float Jitter)
+{
+	if (Basis == PN_BASIS_VALUE)
+	{
+		return PN_Value(P, Period, Seed);
+	}
+
+	if (Basis == PN_BASIS_PERLIN)
+	{
+		return saturate(PN_Perlin(P, Period, Seed) * 0.5f + 0.5f);
+	}
+
+	if (Basis == PN_BASIS_WORLEY_F1)
+	{
+		const float2 W = PN_Worley(P, Period, Seed, Jitter);
+		return saturate(1.0f - W.x); // 1 at the feature point
+	}
+
+	if (Basis == PN_BASIS_WORLEY_F2F1)
+	{
+		const float2 W = PN_Worley(P, Period, Seed, Jitter);
+		return saturate(W.y - W.x); // cell-boundary web
+	}
+
+	if (Basis == PN_BASIS_PERLIN_WORLEY)
+	{
+		// The standard cloud base: Perlin remapped so that Worley's low end
+		// erodes it. Offsetting the Worley seed keeps the two decorrelated.
+		const float Pl = saturate(PN_Perlin(P, Period, Seed) * 0.5f + 0.5f);
+		const float2 W = PN_Worley(P, Period, Seed + 0x9E3779B9u, Jitter);
+		const float Wo = saturate(1.0f - W.x);
+
+		return saturate(PN_Remap(Pl, Wo - 1.0f, 1.0f, 0.0f, 1.0f));
+	}
+
+	return 0.0f;
+}
+
+// ---------------------------------------------------------------------------
+// FBM
+// ---------------------------------------------------------------------------
+
+/** Fractal sum over integer-scaled periods.
+ *
+ *  Octave i uses Period_i = BasePeriod * Lacunarity^i cells across the tile.
+ *  Because every Period_i is a whole number of cells spanning the same [0,1)
+ *  domain, every octave wraps at exactly the same place, so the sum wraps too.
+ *  This is the entire reason Lacunarity is constrained to integers.
+ *
+ *  UVW must be in [0,1) (or any value; the field is periodic with period 1).
+ *  The result is normalised by total amplitude, so it stays in [0,1]. */
+float PN_FBM(
+	int Basis,
+	float3 UVW,
+	int BasePeriod,
+	int Octaves,
+	int Lacunarity,
+	float Gain,
+	uint Seed,
+	float Jitter,
+	bool bRidged)
+{
+	float Sum = 0.0f;
+	float Amplitude = 1.0f;
+	float TotalAmplitude = 0.0f;
+
+	int Period = BasePeriod;
+
+	[loop]
+	for (int i = 0; i < Octaves; ++i)
+	{
+		const int3 Period3 = int3(Period, Period, Period);
+		const float3 P = UVW * (float)Period;
+
+		// Decorrelate octaves. Adding a large odd constant rather than the raw
+		// octave index keeps low-index octaves from sharing hash neighbourhoods.
+		const uint OctaveSeed = Seed + (uint)i * 0x9E3779B9u;
+
+		float V = PN_SampleBasis(Basis, P, Period3, OctaveSeed, Jitter);
+
+		if (bRidged)
+		{
+			V = 1.0f - abs(V * 2.0f - 1.0f);
+		}
+
+		Sum += V * Amplitude;
+		TotalAmplitude += Amplitude;
+
+		Amplitude *= Gain;
+		Period *= Lacunarity;
+	}
+
+	return Sum / max(TotalAmplitude, 1e-6f);
+}

@@ -1,0 +1,149 @@
+// Bake entry point. One thread per voxel, dispatched over a Z slab of the
+// volume; results land in a flat structured buffer sized to the slab, which the
+// CPU reads back and quantizes.
+//
+// Writing to a buffer rather than an RWTexture3D is deliberate. Readback of a
+// volume texture is awkward across RHIs, and the slab-sized buffer also caps
+// VRAM: a full 512^3 float4 target is 512MB resident, whereas a 32-slice slab
+// is 32MB regardless of volume resolution.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/NoiseBaker/Private/PeriodicNoise.ush"
+
+int3	VolumeResolution;
+int		SliceOffset;
+int		SliceCount;
+int		Supersample;
+int		bApplyNormalize;
+
+/** Constant offset added to UVW before evaluation. Zero for a normal bake.
+ *  The tiling self-test dispatches with this set to one unit along an axis and
+ *  compares against the zero-offset result; because the field is periodic with
+ *  period exactly 1.0 in UVW, the two must agree. */
+float3	DomainOffset;
+
+// Gain, OutputMin, OutputMax, WorleyJitter
+float4	ChannelParamsA[4];
+
+// Basis, BasePeriod, Octaves, Lacunarity
+int4	ChannelParamsB[4];
+
+// Seed, Flags, unused, unused
+int4	ChannelParamsC[4];
+
+// NormalizeScale, NormalizeBias, unused, unused
+float4	ChannelNorm[4];
+
+RWStructuredBuffer<float4> OutVolume;
+
+/** Raw FBM for one channel, before normalization and shaping. */
+float EvalChannelRaw(int ChannelIndex, float3 UVW)
+{
+	const float4 A = ChannelParamsA[ChannelIndex];
+	const int4   B = ChannelParamsB[ChannelIndex];
+	const int4   C = ChannelParamsC[ChannelIndex];
+
+	const bool bRidged = (C.y & PN_FLAG_RIDGED) != 0;
+
+	return PN_FBM(
+		/* Basis      */ B.x,
+		/* UVW        */ UVW,
+		/* BasePeriod */ B.y,
+		/* Octaves    */ B.z,
+		/* Lacunarity */ B.w,
+		/* Gain       */ A.x,
+		/* Seed       */ (uint)C.x,
+		/* Jitter     */ A.w,
+		/* bRidged    */ bRidged);
+}
+
+/** Normalization, output remap and inversion, in that order.
+ *
+ *  Order matters: normalizing first means the remap operates on a signal that
+ *  actually spans [0,1], so OutputMin/OutputMax mean what they say regardless
+ *  of the basis's natural range. Inversion is last so it is unambiguous. */
+float ShapeChannel(int ChannelIndex, float Raw)
+{
+	const float4 A = ChannelParamsA[ChannelIndex];
+	const int4   C = ChannelParamsC[ChannelIndex];
+	const float4 N = ChannelNorm[ChannelIndex];
+
+	float V = saturate(Raw * N.x + N.y);
+
+	V = lerp(A.y, A.z, V);
+
+	if ((C.y & PN_FLAG_INVERT) != 0)
+	{
+		V = 1.0f - V;
+	}
+
+	return V;
+}
+
+float4 EvalAllRaw(float3 UVW)
+{
+	return float4(
+		EvalChannelRaw(0, UVW),
+		EvalChannelRaw(1, UVW),
+		EvalChannelRaw(2, UVW),
+		EvalChannelRaw(3, UVW));
+}
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, THREADGROUP_SIZE)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const int3 Local = (int3)DispatchThreadId;
+
+	if (Local.x >= VolumeResolution.x ||
+		Local.y >= VolumeResolution.y ||
+		Local.z >= SliceCount)
+	{
+		return;
+	}
+
+	const int3 Voxel = int3(Local.xy, Local.z + SliceOffset);
+
+	const int SS = max(Supersample, 1);
+	const float InvSS = 1.0f / (float)SS;
+	const float InvSampleCount = 1.0f / (float)(SS * SS * SS);
+
+	float4 Accum = 0.0f;
+
+	[loop]
+	for (int sz = 0; sz < SS; ++sz)
+	{
+		[loop]
+		for (int sy = 0; sy < SS; ++sy)
+		{
+			[loop]
+			for (int sx = 0; sx < SS; ++sx)
+			{
+				// Voxel-centre convention. With SS == 1 this is exactly
+				// (Voxel + 0.5) / Resolution, which places voxel 0 and voxel
+				// N-1 half a voxel inside the tile on either side, so they are
+				// neighbours under wrap addressing. Sampling at
+				// Voxel / (Resolution - 1) instead duplicates the boundary row
+				// and produces a visible seam under an otherwise correct
+				// periodic function.
+				const float3 SubSample = (float3(sx, sy, sz) + 0.5f) * InvSS;
+				const float3 UVW = (float3(Voxel) + SubSample) / float3(VolumeResolution) + DomainOffset;
+
+				Accum += EvalAllRaw(UVW);
+			}
+		}
+	}
+
+	Accum *= InvSampleCount;
+
+	if (bApplyNormalize != 0)
+	{
+		Accum = float4(
+			ShapeChannel(0, Accum.x),
+			ShapeChannel(1, Accum.y),
+			ShapeChannel(2, Accum.z),
+			ShapeChannel(3, Accum.w));
+	}
+
+	const int Index = (Local.z * VolumeResolution.y + Local.y) * VolumeResolution.x + Local.x;
+	OutVolume[Index] = Accum;
+}

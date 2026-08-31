@@ -1,0 +1,73 @@
+# ---------------------------------------------------------------------------
+#  TexLab
+# ---------------------------------------------------------------------------
+#  What this repo is for: the NoiseBaker plugin source, and the recipe assets
+#  that describe every bake. Not the bakes themselves.
+#
+#  A 256^3 BGRA8 volume is 64 MB and noise is near-incompressible, so nothing
+#  shrinks in a repo and every re-bake writes a fresh 64 MB blob that history
+#  keeps forever. The recipes are a few KB each and fully determine their
+#  output, so tracking those and regenerating on demand costs nothing and loses
+#  nothing.
+#
+#  This only works if baked textures and recipes live in separate folders.
+#  Set each recipe's TargetPackagePath to /Game/Noise/Textures and keep the
+#  recipe assets themselves in /Game/Noise/Recipes.
+# ---------------------------------------------------------------------------
+
+# Baked output. Regenerate with the recipe's Bake button.
+Content/Noise/Textures/
+
+# ---------------------------------------------------------------------------
+#  Unreal build artefacts
+#
+#  No leading slash, so these match at any depth and cover the plugin's own
+#  Binaries and Intermediate folders as well as the project's.
+# ---------------------------------------------------------------------------
+
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+Build/
+# Baked output. Regenerate from the recipes in Content/NoiseRecipes.
+Content/Noise/
+
+# ---------------------------------------------------------------------------
+#  Generated project files
+# ---------------------------------------------------------------------------
+
+*.sln
+*.suo
+*.sdf
+*.opensdf
+*.opendb
+*.VC.db
+*.VC.opendb
+*.xcodeproj
+*.xcworkspace
+
+.vs/
+.vscode/
+.idea/
+
+# ---------------------------------------------------------------------------
+#  Compiled binaries
+# ---------------------------------------------------------------------------
+
+*.dll
+*.exe
+*.lib
+*.pdb
+*.so
+*.dylib
+*.a
+
+# ---------------------------------------------------------------------------
+#  OS noise
+# ---------------------------------------------------------------------------
+
+.DS_Store
+Thumbs.db
+desktop.ini
+Content/Resources/TestFile.uasset
