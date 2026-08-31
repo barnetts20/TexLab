@@ -112,37 +112,90 @@ Distribution mode is the exception that proves the rule. It acts on the finished
 
 ## Bipolar output
 
-`bBipolarOutput` emits [-1,1] instead of [0,1], applied last as `v * 2 - 1`. It's the only range control, and it earns its place by changing the **decode contract** rather than the value: on BGRA8 the stored bytes are identical to the unipolar case, and what differs is the recorded `DecodeScale`/`DecodeBias`. On RGBA16F negatives are stored directly.
+`bBipolarOutput` emits [-1,1] instead of [0,1], applied last as `v * 2 - 1`. It is the only range control.
 
-Consumers use one rule either way: `Value = Stored * DecodeScale + DecodeBias`.
+The chain is `normalize -> distribute -> polarity -> encode`, and normalization always targets the full [0,1] using the observed range, so every level is used regardless of polarity.
 
-A bipolar channel must use **Auto (Symmetric About Zero)**; validation rejects plain Auto, which would put the zero crossing wherever the probe landed.
+There is deliberately **no symmetric normalize mode**, because symmetric normalization is a property of the *source*, not the destination. It matters when a basis emits genuinely signed values, so that raw zero and output zero coincide. Every basis here returns [0,1], so raw zero is the bottom of the range rather than a meaningful centre, and normalizing symmetrically against it would strand the data in part of the range and waste the rest.
 
-Asymmetric signed ranges, floors, and headroom all belong at the sample site — `v * (max - min) + min` is one instruction and costs no precision.
+Where the zero crossing lands is set by the distribution stage instead:
 
-## Signed output
+| Distribution | Output zero sits at |
+|---|---|
+| None | Midpoint of the observed range |
+| CenterMedian | The median, so equal volume above and below |
+| Equalize | The median, and the field is uniformly distributed |
 
-Output ranges may go negative. Two things follow.
+**CenterMedian is the right pairing for a displacement field**, since equal mass either side of zero is what gives no net drift.
 
-**Normalize mode.** A signed channel must use **Auto (Symmetric About Zero)**, which normalizes with one magnitude `M = max(|min|, |max|)` about zero. Plain Auto maps the observed minimum to 0, putting the zero crossing wherever the probe happened to land — a constant offset, which for a displacement field means a net drift. Validation rejects the combination.
+When a signed basis arrives -- curl of a vector potential -- a symmetric mode returns, scoped to that basis rather than to the output polarity.
 
-**Storage.** `BGRA8` bias-encodes signed channels into the unsigned texture, spending 256 levels across `[-1,1]` for a step of about 1/127. Fine for density, marginal for warp: warp error is amplified by the gradient of whatever it displaces, so a stair-step in the offset becomes a stair-step in the result. `RGBA16F` stores signed values directly at 8 bytes per voxel — 64³ is 2 MB, 128³ is 16 MB, which is nothing for a warp volume.
+## Storage and decode
 
-Consumers decode uniformly with `Value = Stored * DecodeScale + DecodeBias`, both recorded per channel in `UNoiseBakeAssetUserData`. That's `(1, 0)` for unsigned and for all RGBA16F, `(2, -1)` for signed BGRA8.
+**Bipolar output requires RGBA16F.** Validation rejects the BGRA8 combination.
 
-`bInvert` reflects about the range midpoint rather than computing `1 - v`. Identical for `[0,1]`, but on `[-1,1]` the old form would have flipped the sign *and* shifted by 1.
+BGRA8 is a UNORM format: the texture unit converts `byte/255` to [0,1] in fixed-function hardware before the value reaches any shader, and filtering happens in that space too. There is no asset setting that changes this -- SNORM would be a different pixel format, and `SRGB` only inserts a gamma curve. So a signed channel has to be bias-encoded back into [0,1] on write, which means the texture viewer shows it unsigned, a raymarch samples it unsigned, and the field only reads correctly if every consumer remembers the decode. Nothing about the asset signals that, so the failure is silent and looks like a bake problem rather than a sampling one.
+
+It also halves precision, spending 256 levels across [-1,1] for a step of about 1/127, and warp error is amplified by the gradient of whatever it displaces.
+
+On RGBA16F the encode is identity and negatives are stored directly, so bipolar values show up negative in the viewer and in a marcher with no decode step. Half-float precision is non-uniform, denser near zero, which suits a field centred there. 8 bytes per voxel: 128^3 is 16 MB, 256^3 is 128 MB -- fine for warp and curl volumes, which want low resolution anyway.
+
+Consumers still use one uniform rule, recorded per channel in `UNoiseBakeAssetUserData`:
+
+    Value = Stored * DecodeScale + DecodeBias
+
+which is `(1, 0)` for everything the baker now produces. The encode path for signed BGRA8 is retained but unreachable, so the contract still holds for textures baked before the rule existed.
+
+Format has no effect on the octave budget. The Nyquist rule counts voxels per lattice cell, not bits per channel, so the table above is unchanged. The only indirect cost is memory: if 128 MB pushes you from 256^3 down to 128^3, that costs an octave.
 
 ## Normalization groups
 
 Channels sharing a non-zero `NormalizationGroup` have their probe ranges merged and one scale applied across all of them. `0` means independent.
 
-This exists for vector-valued output. Normalizing vector components independently rescales each axis differently, which rotates and skews every vector in the field — and the result still looks like plausible noise, so nothing in the preview reveals it. For a curl or warp field, put R, G, B in group 1 and leave A at 0. Members must share a normalize mode; validation enforces it.
+This exists for vector-valued output. Normalizing vector components independently rescales each axis differently, which rotates and skews every vector in the field — and the result still looks like plausible noise, so nothing in the preview reveals it. For a curl or warp field, put R, G, B in group 1 and leave A at 0. Members must share a normalize mode; validation enforces it. Grouping is what a signed basis will build on once curl lands.
 
-## Toward curl
+## Vector field bakes
 
-Signed storage and shared normalization are the storage-side prerequisites, and they're in. Real curl noise still needs one more piece: the three components must come from the **curl of a single vector potential**, not from three independently-seeded scalars. Three unrelated scalars in RGB give a field with sources and sinks everywhere, which is exactly what curl noise exists to eliminate.
+`UVectorFieldBakeRecipe` bakes a derivative of a scalar potential into RGB. Separate asset from the packed recipe because the parameter surface differs: one basis, period, octave count and seed driving a single potential, not four independent ones.
 
-The remaining work is a vector-valued channel group that evaluates a periodic potential and takes its curl by central differences at bake time, with epsilon around a quarter voxel — small enough to resolve the finest octave, large enough to avoid float cancellation. Tiling survives it, since the curl of a periodic field is periodic, and so do mips, since divergence is linear and so is a box filter.
+Curl and Gradient share the asset for the mirror-image reason -- their surfaces are *identical*, and the difference is one enum value rather than a different set of knobs. They are the two pure cases of the Helmholtz decomposition, which says any vector field splits into a curl-free part and a divergence-free part.
+
+| Mode | Divergence | Curl | Behaviour | Cost |
+|---|---|---|---|---|
+| **Curl** `∇×P` | zero | nonzero | Pure swirl; stirs without clumping | 12 evals, 3 instances |
+| **Gradient** `∇f` | nonzero | zero | Sources and sinks; attract/repel | 6 evals, 1 instance |
+
+Curl is for advection and warps that move material around. Gradient is the attractor/repulsor field: `+∇f` points uphill toward maxima, so negate at the sample site for attraction. It is baked as `+∇f`, the mathematical definition, since a negate is free at the sample site.
+
+Gradient magnitude goes to zero at maxima and minima. That is correct, not a defect -- a peak is a stable fixed point with no pull.
+
+Three things are forced on the RGB channels rather than authored, each for its own reason. `NormalizationGroup = 1`, because independent scales rescale each axis differently and rotate every vector. `bBipolarOutput`, because sign is direction. And `DistributionMode = None` -- redistribution is monotone and so harmless on a scalar, but on a vector each component would get a *different* remap, which changes every direction. There is no per-component redistribution that preserves a vector field.
+
+For Curl the potential is one authored recipe at three decorrelating seeds. Both extremes fail: three independently authored fields have sources and sinks everywhere, and one instance for all three components collapses the cross terms and confines the output to a plane. The seed offsets avoid multiples of `0x9E3779B9`, which is what `PN_FBM` adds per octave, so no component lands on another's octave.
+
+### Alpha
+
+| Mode | Carries |
+|---|---|
+| Independent | Its own authored scalar field |
+| Vector Magnitude | `\|∇×P\|` or `\|∇f\|` |
+| Scalar Potential | `f` itself; Gradient mode only |
+
+Scalar Potential is usually the best default in Gradient mode: `f` is already evaluated so storing it is free, and one fetch then gives both the field value and its direction of steepest ascent.
+
+Vector Magnitude looks redundant against `length(rgb)` but is not, once mips exist. Averaging vectors that point different directions shortens them; averaging magnitudes does not. So `length(mip2.rgb)` underestimates local strength while a separately mip-filtered magnitude preserves it. Worth a channel only if consumers sample lower mips.
+
+### Gain
+
+Differentiation multiplies each octave by its frequency, so where the potential's octave amplitudes fall as `Gain^i`, the output's fall as `(Gain × Lacunarity)^i`. At the packed default of 0.5 with lacunarity 2 that product is exactly 1.0 -- flat spectrum, fine octaves dominate, output looks like static.
+
+Vector field recipes default to `Gain 0.3, Octaves 3`, and validation warns when the product reaches 1.0.
+
+### Epsilon
+
+Central-difference step in voxels, quarter voxel by default. Too small and the difference of two nearly equal FBM values is dominated by float cancellation; too large and it spans a lattice cell and smooths away the finest octave. Validation checks both bounds, the upper one against the finest octave's cell size rather than an absolute number.
+
+Tiling survives differentiation, since a finite difference of a periodic function is periodic with the same period -- so the tiling self-test applies unchanged and is worth leaving on. Mips survive too: curl and divergence are linear operators and so is a box filter.
 
 ## Bake stamping
 

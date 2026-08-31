@@ -6,6 +6,20 @@
 class UNoiseBakeRecipeBase;
 class UVolumeTexture;
 
+/** What the shader evaluates per voxel. Mirrors NVB_EVAL_* in NoiseBakeCS.usf. */
+enum class ENoiseEvalMode : int32
+{
+	/** Four independent scalar channels. */
+	Packed = 0,
+
+	/** RGB is curl P, where the potential's three components are channel
+	 *  recipes 0, 1 and 2 at decorrelating seeds. */
+	Curl = 1,
+
+	/** RGB is grad f, where f is channel recipe 0. */
+	Gradient = 2,
+};
+
 /** Stages of the shaping chain to run. Mirrors NVB_STAGE_* in NoiseBakeCS.usf. */
 enum class ENoiseShapeStage : int32
 {
@@ -22,6 +36,11 @@ struct FNoiseBakeDispatchParams
 	int32 Resolution = 0;
 	int32 Supersample = 1;
 	ENoiseShapeStage ShapeStage = ENoiseShapeStage::Full;
+	ENoiseEvalMode EvalMode = ENoiseEvalMode::Packed;
+
+	/** Central-difference step for curl, in UVW units. Ignored when packed. */
+	float CurlEpsilon = 0.0f;
+
 	FVector3f DomainOffset = FVector3f::ZeroVector;
 
 	FVector4f ChannelParamsA[4];

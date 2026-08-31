@@ -192,6 +192,8 @@ bool FNoiseVolumeBaker::DispatchSlab(
 			PassParams->SliceCount = SliceCount;
 			PassParams->Supersample = Params.Supersample;
 			PassParams->ShapeStage = (int32)Params.ShapeStage;
+			PassParams->EvalMode = (int32)Params.EvalMode;
+			PassParams->CurlEpsilon = Params.CurlEpsilon;
 			PassParams->DomainOffset = Params.DomainOffset;
 
 			for (int32 Index = 0; Index < 4; ++Index)

@@ -145,6 +145,68 @@ namespace NoiseBakeConstants
 	static constexpr int32 EqualizationLutSize = 64;
 }
 
+/** Which derivative of a scalar potential a vector field bake produces.
+ *
+ *  These are the two pure cases of the Helmholtz decomposition, which says any
+ *  vector field splits into a gradient part and a curl part. They are exact
+ *  complements: a gradient field has zero curl, a curl field has zero
+ *  divergence. Picking the wrong one is not a matter of taste. */
+UENUM(BlueprintType)
+enum class ENoiseVectorFieldMode : uint8
+{
+	/** curl P of a three-component vector potential. Divergence-free: pure
+	 *  swirl, with nothing created or destroyed anywhere in the field.
+	 *
+	 *  This is what you want for advection and for a warp that stirs material
+	 *  around without clumping it. Costs twelve FBM evaluations per voxel and
+	 *  three noise instances, because the three output components must all be
+	 *  derivatives of ONE potential for the divergence-free property to hold. */
+	Curl = 0	UMETA(DisplayName = "Curl (divergence-free, swirl)"),
+
+	/** grad f of a single scalar field. Curl-free: pure sources and sinks.
+	 *
+	 *  Points uphill toward maxima, so negate at the sample site for attraction
+	 *  toward high values. This is the attractor/repulsor field, and it is the
+	 *  right tool for a warp that pulls material into or out of features.
+	 *
+	 *  Half the cost of curl: six evaluations of one noise instance.
+	 *
+	 *  The magnitude goes to zero at maxima and minima, which is correct rather
+	 *  than a defect -- a peak is a stable fixed point with no pull. */
+	Gradient = 1	UMETA(DisplayName = "Gradient (curl-free, attract/repel)"),
+};
+
+/** What the alpha channel of a vector field bake carries. */
+UENUM(BlueprintType)
+enum class ENoiseVectorAlphaMode : uint8
+{
+	/** An entirely independent scalar field, authored like any packed channel. */
+	Independent = 0	UMETA(DisplayName = "Independent Channel"),
+
+	/** |curl P| or |grad f|, the local magnitude of the vector field.
+	 *
+	 *  This looks redundant, since length(rgb) is one instruction. It is not,
+	 *  once mips exist: averaging vectors that point in different directions
+	 *  shortens them, and averaging magnitudes does not. So length(mip2.rgb)
+	 *  systematically underestimates local strength, while a separately baked
+	 *  magnitude that has been mip-filtered preserves it. Same asymmetry that
+	 *  motivates storing normal length separately for specular antialiasing.
+	 *
+	 *  Worth the channel only if consumers actually sample lower mips. */
+	VectorMagnitude = 1	UMETA(DisplayName = "Vector Magnitude"),
+
+	/** The scalar potential f itself. Gradient mode only.
+	 *
+	 *  Usually the best default there: f is already evaluated, so storing it is
+	 *  free, and one fetch then gives both the field value and its direction of
+	 *  steepest ascent. For a warp that is the useful pairing -- you want to know
+	 *  where you are on the field as well as which way it slopes.
+	 *
+	 *  Meaningless in Curl mode, where the potential has three components and no
+	 *  single one of them is "the" potential. Validation rejects it there. */
+	ScalarPotential = 2	UMETA(DisplayName = "Scalar Potential (gradient only)"),
+};
+
 /** How a channel's raw FBM output gets mapped into [0,1].
  *
  *  Note there is no "symmetric about zero" mode, and there deliberately is not

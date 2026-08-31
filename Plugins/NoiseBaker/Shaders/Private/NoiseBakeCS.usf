@@ -28,6 +28,12 @@ int Supersample;
  */
 int ShapeStage;
 
+/** NVB_EVAL_*. Selects what a voxel actually evaluates. */
+int EvalMode;
+
+/** Central-difference step for curl, in UVW units. */
+float CurlEpsilon;
+
 /** Constant offset added to UVW before evaluation. Zero for a normal bake.
  *  The tiling self-test dispatches with this set to one unit along an axis and
  *  compares against the zero-offset result; because the field is periodic with
@@ -164,8 +170,122 @@ float ShapeChannel(int ChannelIndex, float Raw)
     return V * N.z + N.w;
 }
 
+#define NVB_EVAL_PACKED				0
+#define NVB_EVAL_CURL				1
+#define NVB_EVAL_GRADIENT			2
+
+#define NVB_VEC_ALPHA_INDEPENDENT	0
+#define NVB_VEC_ALPHA_MAGNITUDE		1
+#define NVB_VEC_ALPHA_POTENTIAL		2
+
+/** Gradient of a scalar potential, by central differences.
+ *
+ *  f is channel recipe 0. The result is CURL-FREE: pure sources and sinks,
+ *  pointing uphill toward maxima. The exact complement of EvalCurl below, and
+ *  the two are the pure cases of the Helmholtz decomposition.
+ *
+ *  Six evaluations, against curl's twelve, and one noise instance rather than
+ *  three.
+ *
+ *  Baked as +grad f, the mathematical definition. A consumer that wants
+ *  attraction toward high values negates at the sample site, which is free. */
+float3 EvalGradient(float3 UVW)
+{
+    const float E = CurlEpsilon;
+
+    const float3 DX = float3(E, 0.0f, 0.0f);
+    const float3 DY = float3(0.0f, E, 0.0f);
+    const float3 DZ = float3(0.0f, 0.0f, E);
+
+    const float Fxp = EvalChannelRaw(0, UVW + DX);
+    const float Fxn = EvalChannelRaw(0, UVW - DX);
+    const float Fyp = EvalChannelRaw(0, UVW + DY);
+    const float Fyn = EvalChannelRaw(0, UVW - DY);
+    const float Fzp = EvalChannelRaw(0, UVW + DZ);
+    const float Fzn = EvalChannelRaw(0, UVW - DZ);
+
+    const float InvTwoE = 1.0f / (2.0f * max(E, 1e-8f));
+
+    return float3(Fxp - Fxn, Fyp - Fyn, Fzp - Fzn) * InvTwoE;
+}
+
+/** Curl of a vector potential, by central differences.
+ *
+ *  The potential's three components are channel recipes 0, 1 and 2, which the
+ *  recipe fills with one authored potential at three decorrelating seeds.
+ *
+ *  That is what makes the result DIVERGENCE-FREE: all three output components
+ *  are derivatives of a single potential field. Three independently authored
+ *  scalar noises in RGB would have sources and sinks everywhere, which is
+ *  precisely what curl noise exists to eliminate. Using ONE instance for all
+ *  three components fails differently and just as badly: the cross terms
+ *  collapse and the output is confined to a plane.
+ *
+ *  Only the twelve partials the cross product actually needs are evaluated, not
+ *  the full potential at all six neighbours, which would be eighteen.
+ *
+ *  Tiling survives both this and the gradient: the potential is periodic with
+ *  period 1 in UVW, and a finite difference of a periodic function is periodic
+ *  with the same period. */
+float3 EvalCurl(float3 UVW)
+{
+    const float E = CurlEpsilon;
+
+    const float3 DX = float3(E, 0.0f, 0.0f);
+    const float3 DY = float3(0.0f, E, 0.0f);
+    const float3 DZ = float3(0.0f, 0.0f, E);
+
+	// x = dPz/dy - dPy/dz
+    const float Pz_yp = EvalChannelRaw(2, UVW + DY);
+    const float Pz_yn = EvalChannelRaw(2, UVW - DY);
+    const float Py_zp = EvalChannelRaw(1, UVW + DZ);
+    const float Py_zn = EvalChannelRaw(1, UVW - DZ);
+
+	// y = dPx/dz - dPz/dx
+    const float Px_zp = EvalChannelRaw(0, UVW + DZ);
+    const float Px_zn = EvalChannelRaw(0, UVW - DZ);
+    const float Pz_xp = EvalChannelRaw(2, UVW + DX);
+    const float Pz_xn = EvalChannelRaw(2, UVW - DX);
+
+	// z = dPy/dx - dPx/dy
+    const float Py_xp = EvalChannelRaw(1, UVW + DX);
+    const float Py_xn = EvalChannelRaw(1, UVW - DX);
+    const float Px_yp = EvalChannelRaw(0, UVW + DY);
+    const float Px_yn = EvalChannelRaw(0, UVW - DY);
+
+    const float InvTwoE = 1.0f / (2.0f * max(E, 1e-8f));
+
+    return float3(
+		((Pz_yp - Pz_yn) - (Py_zp - Py_zn)) * InvTwoE,
+		((Px_zp - Px_zn) - (Pz_xp - Pz_xn)) * InvTwoE,
+		((Py_xp - Py_xn) - (Px_yp - Px_yn)) * InvTwoE);
+}
+
 float4 EvalAllRaw(float3 UVW)
 {
+    if (EvalMode != NVB_EVAL_PACKED)
+    {
+        const float3 V = (EvalMode == NVB_EVAL_CURL) ? EvalCurl(UVW) : EvalGradient(UVW);
+
+        const int AlphaMode = ChannelParamsC[3].w;
+
+        float Alpha;
+        if (AlphaMode == NVB_VEC_ALPHA_MAGNITUDE)
+        {
+            Alpha = length(V);
+        }
+        else if (AlphaMode == NVB_VEC_ALPHA_POTENTIAL)
+        {
+            Alpha = EvalChannelRaw(0, UVW);
+        }
+        else
+        {
+            Alpha = EvalChannelRaw(3, UVW);
+        }
+
+        return float4(V, Alpha);
+    }
+
     return float4(
 		EvalChannelRaw(0, UVW),
 		EvalChannelRaw(1, UVW),

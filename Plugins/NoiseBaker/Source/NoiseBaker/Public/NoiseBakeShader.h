@@ -28,6 +28,8 @@ public:
 		SHADER_PARAMETER(int32, SliceCount)
 		SHADER_PARAMETER(int32, Supersample)
 		SHADER_PARAMETER(int32, ShapeStage)
+		SHADER_PARAMETER(int32, EvalMode)
+		SHADER_PARAMETER(float, CurlEpsilon)
 		SHADER_PARAMETER(FVector3f, DomainOffset)
 
 		/** x: Gain, y: WorleyJitter, z/w: unused */
@@ -36,7 +38,8 @@ public:
 		/** x: Basis, y: BasePeriod, z: Octaves, w: Lacunarity */
 		SHADER_PARAMETER_ARRAY(FIntVector4, ChannelParamsB, [4])
 
-		/** x: Seed, y: Flags (PN_FLAG_*), z: DistributionMode, w: unused */
+		/** x: Seed, y: Flags (PN_FLAG_*), z: DistributionMode,
+		 *  w: curl alpha mode, read from index 3 only */
 		SHADER_PARAMETER_ARRAY(FIntVector4, ChannelParamsC, [4])
 
 		/** x: NormalizeScale, y: NormalizeBias, z: EncodeScale, w: EncodeBias */

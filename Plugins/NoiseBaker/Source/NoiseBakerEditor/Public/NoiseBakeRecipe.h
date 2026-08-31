@@ -14,7 +14,7 @@
  *  curl bake, where one potential drives three components -- the authoring
  *  surface belongs in its own asset rather than here, because expressing it
  *  through four channel structs would mean three that must be kept identical
- *  and a comment explaining the rule. See UCurlBakeRecipe.
+ *  and a comment explaining the rule. See UVectorFieldBakeRecipe.
  *
  *  The recipe is the authored artefact; the volume texture is derived output.
  *  Keeping them separate is what makes it possible to re-bake at 4x resolution,
