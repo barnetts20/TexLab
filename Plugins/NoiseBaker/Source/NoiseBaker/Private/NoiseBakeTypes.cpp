@@ -93,17 +93,6 @@ namespace NoiseBakeValidation
 			return false;
 		}
 
-		if (Channel.IsSigned() && Channel.NormalizeMode == ENoiseNormalizeMode::AutoProbe)
-		{
-			OutError = FString::Printf(
-				TEXT("%s: bBipolarOutput is set, but the normalize mode is plain Auto. Auto maps the ")
-				TEXT("observed minimum to 0, so after the polarity conversion the zero crossing sits ")
-				TEXT("wherever the probe happened to land rather than at the middle of the field. Use ")
-				TEXT("Auto (Symmetric About Zero) for any channel whose sign is meaningful."),
-				ChannelName);
-			return false;
-		}
-
 		if (Channel.NormalizeMode == ENoiseNormalizeMode::Manual &&
 			Channel.ManualMax - Channel.ManualMin < KINDA_SMALL_NUMBER)
 		{

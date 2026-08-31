@@ -1,6 +1,6 @@
 #include "NoiseVolumeBaker.h"
 
-#include "NoiseBakeRecipe.h"
+#include "NoiseBakeRecipeBase.h"
 #include "NoiseBakeShader.h"
 
 #include "Engine/VolumeTexture.h"
@@ -89,7 +89,7 @@ namespace NoiseBakeInternal
 // Parameter packing
 // ---------------------------------------------------------------------------
 
-void FNoiseVolumeBaker::BuildDispatchParams(const UNoiseBakeRecipe& Recipe, FNoiseBakeDispatchParams& OutParams)
+void FNoiseVolumeBaker::BuildDispatchParams(const UNoiseBakeRecipeBase& Recipe, FNoiseBakeDispatchParams& OutParams)
 {
 	OutParams.Resolution = Recipe.Resolution;
 	OutParams.Supersample = FMath::Max(Recipe.Supersample, 1);
@@ -137,6 +137,9 @@ void FNoiseVolumeBaker::BuildDispatchParams(const UNoiseBakeRecipe& Recipe, FNoi
 			(float)(Base + 2) / 63.0f,
 			(float)(Base + 3) / 63.0f);
 	}
+
+	// Last, so a subclass can override anything above rather than only append.
+	Recipe.ConfigureEvaluation(OutParams);
 }
 
 // ---------------------------------------------------------------------------
@@ -308,7 +311,7 @@ namespace
 // ---------------------------------------------------------------------------
 
 bool FNoiseVolumeBaker::RunProbePass(
-	const UNoiseBakeRecipe& Recipe,
+	const UNoiseBakeRecipeBase& Recipe,
 	FNoiseBakeDispatchParams& InOutParams,
 	TArray<FNoiseChannelNormalization>& OutNormalization,
 	FString& OutError)
@@ -433,6 +436,24 @@ bool FNoiseVolumeBaker::RunProbePass(
 			const float Padding = Span * NoiseBakeInternal::ProbePadding;
 			RangeMin -= Padding;
 			RangeMax += Padding;
+
+			// A signed SOURCE normalizes about zero using one magnitude, so raw
+			// zero maps to the middle of [0,1] and survives the polarity
+			// conversion as the field's actual zero. Normalizing it about the
+			// midpoint of the observed range instead would put the zero crossing
+			// wherever the probe happened to land, which for a displacement
+			// field is a constant drift.
+			//
+			// This is asked of the recipe rather than exposed as a normalize
+			// mode because it is a property of the source. Applying it to an
+			// unsigned basis, whose raw output is already [0,1], would strand
+			// the data in part of the range and waste the rest.
+			if (Recipe.IsChannelSourceSigned(Index))
+			{
+				const float Magnitude = FMath::Max(FMath::Abs(RangeMin), FMath::Abs(RangeMax));
+				RangeMin = -Magnitude;
+				RangeMax = Magnitude;
+			}
 			break;
 		}
 
@@ -872,7 +893,7 @@ void FNoiseVolumeBaker::BuildBrickBounds(
 // Asset output
 // ---------------------------------------------------------------------------
 
-UVolumeTexture* FNoiseVolumeBaker::ResolveOrCreateTexture(UNoiseBakeRecipe& Recipe, FString& OutError)
+UVolumeTexture* FNoiseVolumeBaker::ResolveOrCreateTexture(UNoiseBakeRecipeBase& Recipe, FString& OutError)
 {
 	if (!Recipe.TargetTexture.IsNull())
 	{
@@ -918,7 +939,7 @@ UVolumeTexture* FNoiseVolumeBaker::ResolveOrCreateTexture(UNoiseBakeRecipe& Reci
 }
 
 bool FNoiseVolumeBaker::WriteTexture(
-	UNoiseBakeRecipe& Recipe,
+	UNoiseBakeRecipeBase& Recipe,
 	UVolumeTexture& Texture,
 	const TArray<uint8>& Texels,
 	const TArray<FNoiseChannelNormalization>& Normalization,
@@ -1015,7 +1036,7 @@ bool FNoiseVolumeBaker::WriteTexture(
 // Entry point
 // ---------------------------------------------------------------------------
 
-bool FNoiseVolumeBaker::Bake(UNoiseBakeRecipe* Recipe, FString& OutError)
+bool FNoiseVolumeBaker::Bake(UNoiseBakeRecipeBase* Recipe, FString& OutError)
 {
 	check(IsInGameThread());
 

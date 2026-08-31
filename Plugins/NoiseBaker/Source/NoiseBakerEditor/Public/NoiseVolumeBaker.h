@@ -3,7 +3,7 @@
 #include "CoreMinimal.h"
 #include "NoiseBakeTypes.h"
 
-class UNoiseBakeRecipe;
+class UNoiseBakeRecipeBase;
 class UVolumeTexture;
 
 /** Stages of the shaping chain to run. Mirrors NVB_STAGE_* in NoiseBakeCS.usf. */
@@ -41,11 +41,11 @@ class NOISEBAKEREDITOR_API FNoiseVolumeBaker
 public:
 	/** Runs the whole pipeline. Returns false with a reason on failure.
 	 *  Must be called from the game thread. */
-	static bool Bake(UNoiseBakeRecipe* Recipe, FString& OutError);
+	static bool Bake(UNoiseBakeRecipeBase* Recipe, FString& OutError);
 
 	/** Packs a recipe's channels into GPU parameters. Normalization is left at
 	 *  identity; FillNormalization applies the probe result afterwards. */
-	static void BuildDispatchParams(const UNoiseBakeRecipe& Recipe, FNoiseBakeDispatchParams& OutParams);
+	static void BuildDispatchParams(const UNoiseBakeRecipeBase& Recipe, FNoiseBakeDispatchParams& OutParams);
 
 	/** Dispatches one Z slab and blocks until the readback completes.
 	 *  OutSlab is sized to Resolution * Resolution * SliceCount. */
@@ -58,7 +58,7 @@ public:
 
 private:
 	static bool RunProbePass(
-		const UNoiseBakeRecipe& Recipe,
+		const UNoiseBakeRecipeBase& Recipe,
 		FNoiseBakeDispatchParams& InOutParams,
 		TArray<FNoiseChannelNormalization>& OutNormalization,
 		FString& OutError);
@@ -87,10 +87,10 @@ private:
 		FIntVector& OutDimensions,
 		TArray<float>& OutBrickMinMax);
 
-	static UVolumeTexture* ResolveOrCreateTexture(UNoiseBakeRecipe& Recipe, FString& OutError);
+	static UVolumeTexture* ResolveOrCreateTexture(UNoiseBakeRecipeBase& Recipe, FString& OutError);
 
 	static bool WriteTexture(
-		UNoiseBakeRecipe& Recipe,
+		UNoiseBakeRecipeBase& Recipe,
 		UVolumeTexture& Texture,
 		const TArray<uint8>& Texels,
 		const TArray<FNoiseChannelNormalization>& Normalization,
