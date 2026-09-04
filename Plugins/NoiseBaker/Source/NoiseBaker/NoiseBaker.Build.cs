@@ -13,7 +13,8 @@ public class NoiseBaker : ModuleRules
 			"Engine",
 			"RenderCore",
 			"RHI",
-		});
+            "DeveloperSettings",
+        });
 
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{

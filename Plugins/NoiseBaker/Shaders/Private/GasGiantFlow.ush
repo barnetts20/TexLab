@@ -1,0 +1,1333 @@
+#pragma once
+
+// ---------------------------------------------------------------------------
+// Gas giant banding and flow. Three baked volumes, one Custom node.
+//
+// WHY GAS GIANTS BAND, since the whole design follows from it.
+//
+// Rapid rotation makes the flow quasi-2D. Two-dimensional turbulence cascades
+// energy UPWARD in scale rather than downward, so structure grows instead of
+// dissipating. On a sphere the Coriolis parameter varies with latitude, which
+// makes that cascade anisotropic: it feeds east-west modes preferentially,
+// because north-south motion radiates Rossby waves and east-west motion does
+// not. The cascade arrests at the Rhines scale, into zonal jets.
+//
+// The forcing is isotropic. The banding is anisotropic STRAINING of isotropic
+// structure. So isotropic noise, differentially rotated, is not an
+// approximation of the process -- it is the process.
+//
+// THE THREE OPERATIONS, deliberately separated.
+//
+//   Structure   Filaments and whorls. Comes free from sampling the field at a
+//               differentially rotated position. Static in time, so its
+//               magnitude is unbounded and costs nothing.
+//
+//   Transport   Bands orbiting at their own rates. The SAME rotation, with
+//               time in it. Rigid per latitude, so exact and good forever.
+//
+//   Evolution   Things changing rather than merely moving. A small drift of
+//               the lookup, bounded.
+//
+// Structure and transport being one operation is the point. SpinUpTime is
+// literally how long the planet has been turning before frame zero: start at
+// t = 40 rather than t = 0 and the field opens already wound into filaments.
+//
+// WHY ROTATION AND NOT DISPLACEMENT.
+//
+// No offset added to a coordinate produces orbiting; it produces scrolling
+// across an axis, and on a sphere it also drags latitude. Displacing along the
+// east vector by c and renormalizing moves along a CHORD, so the length becomes
+// sqrt(1 + c*c) and the latitude creeps equatorward as c grows.
+//
+// Rotation about Z preserves P.z and |P| identically. Every latitude ring maps
+// onto itself, the Jacobian determinant is exactly 1, and there is no
+// accumulation error to reset. A latitude-only pattern is invariant under it,
+// which is the precise statement that zonal flow cannot disturb its own bands.
+//
+// WHY GRADIENT AND NOT CURL, for both flow textures.
+//
+// Curl is divergence-free in 3D, but the 3D divergence includes radial terms
+// that projecting onto the tangent plane discards, so a projected curl field is
+// NOT divergence-free on the sphere. cross(N, grad psi) is, exactly, for any
+// scalar psi. Gradient is also half the bake: six evaluations against twelve,
+// one noise instance against three.
+//
+// WHAT THE CROSSFADE IS FOR.
+//
+// Not drift; the rotation is exact. Winding eventually drives filaments below
+// texel width, and the crossfade is what bounds that.
+//
+// Its visible cost scales with Period/SpinUpTime: across one cycle the total
+// shear goes from SpinUp to SpinUp + Period, so with SpinUp large that is a few
+// percent and the reset is nearly invisible. More filamentation and a less
+// visible reset are the same knob turned the same way.
+//
+// The weight of a phase must fall to ZERO at the instant that phase resets.
+// That is the only thing hiding the discontinuity, and inverting it makes the
+// reset play at full opacity as a hard edge sweeping the surface.
+//
+// THE THREE TEXTURES.
+//
+//   CoarseFlow   Gradient + ScalarPotential alpha, RGBA16F. RGB is grad psi,
+//                A is psi itself, read as pressure -- cross(N, grad psi) is the
+//                geostrophic relation, so the circulation around a high or low
+//                is not decorated on afterwards, it falls out of the same
+//                derivative. Drives the primary warp. Crossfaded.
+//
+//   DetailFlow   Gradient + INDEPENDENT alpha, RGBA16F. RGB is a finer grad
+//                psi for the second warp octave; A is a free channel, best
+//                spent on Worley F2-F1, whose cell walls give the filament
+//                network directly. The C0 warning on F2-F1 does not apply here
+//                because this channel is read, never differentiated.
+//                Crossfaded.
+//
+//   PackedDetail Four independent scalars, BGRA8. Not crossfaded -- see
+//                GG_GasGiant. This is where the 4x storage saving belongs,
+//                since all four channels are unipolar.
+//
+// ALL SAMPLERS MUST BE WRAP ON ALL THREE AXES.
+// ---------------------------------------------------------------------------
+
+/** Steps used to integrate the coarse warp.
+ *
+ *  1 is a single straight displacement, which is what a domain warp normally is
+ *  and what this had before. It cannot produce roll-up: material moves once
+ *  along the local flow direction and stops, so the SHAPE of the streamline
+ *  never reaches the output no matter what the field contains.
+ *
+ *  2 or more traces the streamline instead. Total displacement is unchanged --
+ *  each step takes 1/N of it -- but the path bends as it goes, so material
+ *  actually winds around a vortex. This is what makes Swirl.x mean
+ *  anything at all, and what lets a filament curl back into a swirl rather than
+ *  running off a band forever.
+ *
+ *  Costs one fetch per step per phase. 2 is usually enough; 3 curls harder. */
+#ifndef GG_WARP_ITERATIONS
+#define GG_WARP_ITERATIONS 4
+#endif
+
+/** Collapse both crossfade phases into one. A DIAGNOSTIC, not a shipping mode:
+ *  shear then accumulates without bound and will eventually alias. Set it to
+ *  find out whether an artifact is the crossfade or the field, because two
+ *  phases far enough apart in shear are sampling unrelated states and blending
+ *  them produces hooks and doubled contours that look nothing like either. */
+#ifndef GG_SINGLE_PHASE
+#define GG_SINGLE_PHASE 0
+#endif
+
+/** Replace the returned cloud top with the step count, normalized against
+ *  InMaxSteps, for a cost heatmap. */
+#ifndef GG_DEBUG_STEPS
+#define GG_DEBUG_STEPS 0
+#endif
+
+/** Enable the second warp octave and its ridge channel. Costs one extra fetch
+ *  PER PHASE, so two in total. Worth it on a surface; the first thing to switch
+ *  off if this construction moves into a raymarch loop. */
+#ifndef GG_DETAIL_OCTAVE
+#define GG_DETAIL_OCTAVE 1
+#endif
+
+/** Include the packed detail layer. One extra fetch PER PHASE. */
+#ifndef GG_PACKED_DETAIL
+#define GG_PACKED_DETAIL 1
+#endif
+
+/** Replace the band output with the raw crossfade weight, for checking that the
+ *  reset is invisible. Should be smooth low-frequency mush with no correlation
+ *  to the bands or the flow; any hard contour is a reset showing through. */
+#ifndef GG_DEBUG_CROSSFADE
+#define GG_DEBUG_CROSSFADE 0
+#endif
+
+/** Rotation about the planet's axis. The only transport primitive used here.
+ *
+ *  Exact for any angle, so it never needs to be small and never needs a reset.
+ *  Preserves P.z, which is what leaves the bands undisturbed. */
+float3 GG_RotateZ(float3 P, float Angle)
+{
+    float SinA, CosA;
+    sincos(Angle, SinA, CosA);
+
+    return float3(
+		P.x * CosA - P.y * SinA,
+		P.x * SinA + P.y * CosA,
+		P.z);
+}
+
+/** The raw alternating shape, before plateau shaping. Roughly [-1.45, 1.45].
+ *
+ *  EVEN in S, so mirrored latitudes rotate the same way. An odd form makes the
+ *  hemispheres counter-rotate, which puts a shear seam along the equator and is
+ *  not what any real gas giant does.
+ *
+ *  Written in sin(latitude) rather than latitude so jets come out equal AREA
+ *  rather than equal angle, which stops every band crowding into the poles.
+ *
+ *  The second cosine is at an incommensurate frequency so jet spacing stops
+ *  looking regular. Both terms are pure cosines with no phase offset, which is
+ *  what keeps the sum even and also smooth across the equator -- a phase offset
+ *  or an abs() would put a kink at S = 0.
+ *
+ *  Asymmetry adds a small ODD term back. Perfect mirror symmetry is its own
+ *  artifact: the eye picks it up immediately and it reads as a decal rather
+ *  than a planet. */
+float GG_JetRaw(float S, float BandCount, float Asymmetry)
+{
+    const float K = BandCount * PI;
+
+    float Shape = cos(K * S);
+    Shape += 0.45f * cos(K * 1.7f * S);
+    Shape += Asymmetry * sin(K * 0.6f * S);
+
+    return Shape;
+}
+
+/** d(JetRaw)/dS in closed form. Term-for-term the derivative of GG_JetRaw,
+ *  scaled the same way, so the two cannot drift apart silently.
+ *
+ *  This is the local shear rate per unit time, and it is what tells the relief
+ *  how thin a region has been stretched. */
+float GG_JetRawSlope(float S, float BandCount, float Asymmetry)
+{
+    const float K = BandCount * PI;
+
+    float D = -K * sin(K * S);
+    D += -0.45f * K * 1.7f * sin(K * 1.7f * S);
+    D += Asymmetry * K * 0.6f * cos(K * 0.6f * S);
+
+    return D * 0.6897f;
+}
+
+/** Plateau shaping, and the boundary mask that falls out of it.
+ *
+ *  THIS IS WHY BANDS HAVE A SOLID MIDDLE.
+ *
+ *  A sum of cosines is curving everywhere and is flat nowhere, so a band built
+ *  from one has no interior -- only a rising edge that immediately becomes a
+ *  falling edge. Jupiter is the opposite: wide flat zones and belts with narrow
+ *  transitions between them. Pushing the raw shape through a smoothstep of
+ *  controllable width produces genuine plateaus, and the width is the single
+ *  control over how much of a band is middle versus edge.
+ *
+ *  THIS IS ALSO WHY TURBULENCE BELONGS AT THE EDGES.
+ *
+ *  Shaping the RATE this way, not just the brightness, means dRate/dS falls to
+ *  near zero inside a plateau and spikes at the crossing. Shear concentrates at
+ *  band boundaries by construction rather than by a separate mask, which is
+ *  where a real gas giant's curls and billows are and where a uniform-shear
+ *  model puts them everywhere equally.
+ *
+ *  The consequence worth planning around: SpinUpTime now acts almost entirely
+ *  on the boundaries. Winding hard enough to stretch features horizontal no
+ *  longer shreds the zone interiors into micro-banding, because the interiors
+ *  are barely being wound at all. Flatness and SpinUpTime stop fighting.
+ *
+ *  Shaping is MONOTONE, so it moves no zero crossings. Bands and jets stay
+ *  registered with each other however hard this is driven.
+ *
+ *  BandShape.x  Flatness. 0 leaves the raw curve, 1 is nearly a square wave.
+ *  BandShape.z  Relief thinning; see GG_EvaluatePhase.
+ *  BandShape.y  Width bias. Offsets the crossing so zones and belts need not
+ *               be the same width, which on Jupiter they are not -- belts are
+ *               the narrower of the two.
+ *
+ *  OutBoundary is 1 at a transition and 0 in a plateau. It is 4t(1-t) on the
+ *  smoothstep's own parameter, so it costs a multiply and tracks the shaping
+ *  exactly rather than approximating it. */
+void GG_JetShaped(
+	float S,
+	float BandCount,
+	float Asymmetry,
+	float3 BandShape,
+	out float OutShape,
+	out float OutBoundary,
+	out float OutRaw)
+{
+	// 1/1.45, normalizing the raw range to roughly [-1,1] so the width
+	// parameters mean the same thing regardless of Asymmetry.
+    const float Raw = GG_JetRaw(S, BandCount, Asymmetry) * 0.6897f - BandShape.y;
+
+    const float Width = max(1.0f - BandShape.x, 0.02f);
+
+    const float T = saturate((Raw + Width) / (2.0f * Width));
+
+    OutShape = 2.0f * (T * T * (3.0f - 2.0f * T)) - 1.0f;
+    OutBoundary = 4.0f * T * (1.0f - T);
+
+	// Unshaped, and clamped only. The rate uses THIS rather than OutShape,
+	// because a plateau has zero slope and dRate/dS is the entire source of
+	// shear -- shaping the rate flattens the winding out of every band interior
+	// and leaves ShearFalloff scaling something that is already zero there.
+	//
+	// Registration survives the split: both are monotone functions of the same
+	// raw value, so they share every zero crossing however differently they are
+	// shaped. Turbulence stays concentrated at the boundaries through
+	// OutBoundary, which is a mask rather than a slope and does not need the
+	// rate flattened to work.
+    OutRaw = clamp(Raw, -1.0f, 1.0f);
+}
+
+/** Angular rate. Radians per unit time.
+ *
+ *  Rate, not linear speed. A linear speed would have to be divided by cos(lat)
+ *  to become an angle, which is singular at the poles for no benefit.
+ *
+ *  EquatorialBoost widens and strengthens the jet at S = 0. The base shape
+ *  already puts a prograde jet there, since cos(0) is 1 -- that comes free with
+ *  evenness and is correct for Jupiter -- so this shapes an existing jet rather
+ *  than inventing one.
+ *
+ *  It is added AFTER the plateau shaping, deliberately. Shaping it would flatten
+ *  the equatorial jet into just another plateau and lose the one profile feature
+ *  that is genuinely a peak rather than a step.
+ *
+ *  What makes STRUCTURE is dRate/dS, not Rate. A constant added to every
+ *  latitude is a rigid spin and produces no shear at all; only the differences
+ *  between latitudes wind anything. That is why RigidRate is pulled out of the
+ *  crossfade downstream, and why setting it near the profile's PEAK rather than
+ *  its mean will flatten the shear there and make SpinUpTime appear to stop
+ *  working. */
+float GG_ZonalRate(
+	float S,
+	float BandCount,
+	float JetStrength,
+	float EquatorialBoost,
+	float Asymmetry,
+	float3 BandShape)
+{
+    float Shape, Boundary, Raw;
+    GG_JetShaped(S, BandCount, Asymmetry, BandShape, Shape, Boundary, Raw);
+
+    const float Boost = EquatorialBoost * exp(-S * S * 12.0f);
+
+    return JetStrength * (Raw + Boost);
+}
+
+/** Band brightness, derived from the same shape as the jets.
+ *
+ *  Bands mark jets -- zones and belts are the visible signature of the shear
+ *  between them -- so shaping the two with independent functions that merely
+ *  share a frequency lets them drift out of phase, and then the bands sit in
+ *  the wrong place relative to the flow supposedly making them.
+ *
+ *  Takes an already-warped coordinate, so meander and jitter survive.
+ *
+ *  BandSharpness now only adds contrast on top of the plateau. With Flatness
+ *  doing the flattening it can stay near 1; driving it hard clips the shaped
+ *  value and terraces the height field. */
+float GG_BandProfile(
+	float BandCoord,
+	float BandCount,
+	float Asymmetry,
+	float3 BandShape,
+	float BandSharpness)
+{
+    float Shape, Boundary, Raw;
+    GG_JetShaped(BandCoord, BandCount, Asymmetry, BandShape, Shape, Boundary, Raw);
+
+    return saturate(0.5f + 0.5f * Shape * BandSharpness);
+}
+
+/** Low-frequency static per-point phase offset for the crossfade.
+ *
+ *  Must be constant in time for a given surface point, so it is a function of
+ *  the UNSHEARED direction. Analytic rather than a fetch because it only needs
+ *  to be decorrelated, not to look like anything.
+ *
+ *  Deliberately low frequency. High-frequency jitter makes neighbouring texels
+ *  reset at very different times, which reads as boiling. */
+float GG_PhaseJitter(float3 N)
+{
+    const float A = sin(dot(N, float3(3.7f, 1.9f, 2.3f)));
+    const float B = sin(dot(N, float3(-1.7f, 3.1f, 4.3f)));
+
+    return 0.5f + 0.5f * A * B;
+}
+
+/** Perlin dilated by inverted Worley -- the standard cloud-shape combine.
+ *
+ *  Perlin alone is smooth undulation with no sense of a cloud EDGE. Worley F1
+ *  inverted is billowy blobs with no interior variation. Remapping the first by
+ *  the second keeps Perlin's detail while giving it Worley's rounded boundary,
+ *  and that rounded boundary is what reads as fluffiness.
+ *
+ *  This has to happen in the shader rather than the bake because the baker's
+ *  channels are independent by construction -- there is no cross-channel
+ *  operation in the recipe model, and adding one would compromise the thing
+ *  that makes the probe, grouping and brick bounds work. Two channels out, one
+ *  combine in, no fetch cost.
+ *
+ *  Worley here is the raw F1, which is LOW at cell centres, so the remap floor
+ *  uses it directly rather than inverted. */
+float GG_PerlinWorley(float Perlin, float WorleyF1)
+{
+    const float Low = -WorleyF1;
+
+    return saturate((Perlin - Low) / max(1.0f - Low, 1e-3f));
+}
+
+/** One crossfade phase. Everything sheared lives here and it runs twice.
+ *
+ *  PER-LAYER SHEAR, which is the reason ShearFalloff exists.
+ *
+ *  Shear turns a feature of size L into one L(1+g) long and L/(1+g) wide. Once
+ *  that narrow dimension falls below a texel the feature aliases rather than
+ *  filaments. Coarse features survive a large g and become the long streaks
+ *  that make the look; fine features hit the texel limit at a fraction of the
+ *  same g and dissolve into grain. Shearing every layer by the same amount is
+ *  therefore wrong, and it is wrong in a way that gets worse the more detail
+ *  you add.
+ *
+ *  It is also wrong physically. Eddy turnover time scales with eddy size, so a
+ *  small eddy is regenerated long before it accumulates much strain. Only the
+ *  large structures live long enough to be wound. ShearFalloff is that
+ *  lifetime ratio, and it should fall roughly as the inverse of each layer's
+ *  frequency.
+ *
+ *  Each layer still inherits the DISPLACEMENT of the layers above it, so the
+ *  fine structure sits on the coarse filaments. Only the accumulated strain
+ *  differs. Position and strain history are separate things and this is the
+ *  one place that distinction earns its keep.
+ *
+ *  Scales        float4(Coarse, Detail, Packed, PackedWarpInherit)
+ *  Warps         float4(CoarseWarp, DetailWarp, BandJitter, TurbulenceFloor)
+ *  Detail        float4(Ridge, Mottle, Wisp, EdgeBias)
+ *  ShearFalloff  float4(Coarse, Detail, Packed, DetailWarpInherit)
+ *
+ *  Returns float4(Band, Pressure, Composition, StormCells). */
+float4 GG_EvaluatePhase(
+	Texture3D CoarseFlow,
+	SamplerState CoarseSampler,
+	Texture3D DetailFlow,
+	SamplerState DetailSampler,
+	Texture3D PackedDetail,
+	SamplerState PackedSampler,
+	float3 P,
+	float3 N,
+	float S,
+	float ShearTime,
+	float DriftTime,
+	float RigidRate,
+	float3 Drift,
+	float4 Scales,
+	float4 Warps,
+	float4 Detail,
+	float4 ShearFalloff,
+	float BandCount,
+	float JetStrength,
+	float EquatorialBoost,
+	float Asymmetry,
+	float3 BandShape,
+	float BandSharpness,
+	float2 Swirl)
+{
+	// A rotation shared by every latitude produces no shear at all, so it does
+	// not wind anything and has no business inside the crossfade. Pulled out
+	// here, both phases share it exactly and the only mismatch left to blend is
+	// the residual differential rotation, which is what the crossfade is for.
+	//
+	// It is also the term that makes the planet turn as a planet, and it runs
+	// on DriftTime, which never resets.
+	// Boundary is 1 at a band transition, 0 in a plateau. Computed at the
+	// UNWARPED latitude: it modulates the warp, so deriving it from the warped
+	// coordinate would make the warp depend on itself.
+    float JetShape, Boundary, JetRaw;
+    GG_JetShaped(S, BandCount, Asymmetry, BandShape, JetShape, Boundary, JetRaw);
+
+    const float Rate = GG_ZonalRate(S, BandCount, JetStrength, EquatorialBoost, Asymmetry, BandShape);
+
+	// Turbulence follows the shear, and after plateau shaping the shear lives at
+	// the boundaries. Zone interiors go nearly laminar, which is what stops the
+	// bands reading as one scalloped curve repeated all the way round: the
+	// scalloping now happens only where two jets are actually rubbing together.
+	//
+	// Warps.w is the floor, since a real zone interior is calmer than its edges
+	// but not glass.
+    const float Turbulence = lerp(Warps.w, 1.0f, Boundary);
+
+	// ZERO MEAN by construction, which is what lets ShearFalloff differ per
+	// layer without moving the layers apart.
+	//
+	// Rate - RigidRate was not zero-mean unless RigidRate happened to equal the
+	// profile's mean, and a constant inside this term is a RIGID rotation:
+	// scaling it by a per-layer falloff slides each layer to a different
+	// longitude while changing nobody's strain. At the previous defaults that
+	// left the coarse and detail layers most of a turn apart, sampling
+	// unrelated parts of their own fields.
+	//
+	// The raw jet shape is symmetric about zero already, so only the part that
+	// actually varies with latitude -- the part that actually winds anything --
+	// gets scaled.
+    const float Differential = JetStrength * JetRaw;
+
+	// Transport, shared by every layer and never reset. Constant in S on
+	// purpose: a latitude-varying transport term would wind without bound and
+	// without a crossfade to catch it.
+    const float ThetaRigid = RigidRate * DriftTime;
+
+	// -- Coarse: full shear, big features, becomes the filaments -------------
+
+    const float3 PCoarse = GG_RotateZ(P, -(ThetaRigid + Differential * ShearTime * ShearFalloff.x));
+
+	// Integrated over GG_WARP_ITERATIONS steps rather than applied in one.
+	//
+	// Each step takes 1/N of the total displacement and re-samples where it
+	// arrived, so the path follows the field instead of leaving along a single
+	// tangent. Total distance travelled is unchanged; what changes is that the
+	// result carries the streamline's CURVATURE. That is the entire difference
+	// between a filament running straight off a band forever and one winding
+	// back into a swirl, and with one step it is unobtainable no matter what
+	// the field looks like -- a single displacement moves material once and
+	// stops, so the shape of the streamline never appears in the output.
+	//
+	// Drift is separate from shear: shear moves material along the flow, drift
+	// changes the flow itself. Without it the field is a fixed pattern stirred
+	// forever with nothing new ever appearing.
+
+	// Rate at the shading point's own latitude. The integration runs in the
+	// frame CO-MOVING with this, which is what makes closed streamlines
+	// possible at all: cat's eyes exist only in the frame moving with the
+	// vortex, and in any other frame the same flow is open and streaming.
+    const float RateHere = GG_ZonalRate(S, BandCount, JetStrength, EquatorialBoost, Asymmetry, BandShape);
+
+    float3 Pos = PCoarse;
+
+	// Warps.x is a TIME, not a displacement.
+	//
+	// A cat's eye needs roughly one vortex turnover to form. Treating the warp
+	// as a fixed displacement caps how far the path can wind regardless of how
+	// strong the flow is, so the roll-up could never complete and every
+	// stretched contour ended in a rounded turnaround.
+    const float StepTime = (Warps.x * Turbulence) / (float) GG_WARP_ITERATIONS;
+
+    float Pressure = 0.0f;
+
+	[unroll]
+    for (int It = 0; It < GG_WARP_ITERATIONS; It++)
+    {
+        const float3 CoarseUVW = Pos * Scales.x + Drift * DriftTime;
+        const float4 Coarse = CoarseFlow.SampleLevel(CoarseSampler, CoarseUVW, 0.0f);
+
+        if (It == 0)
+        {
+			// From the unwarped position, so the pressure reported matches the
+			// circulation that drove the first step. RGBA16F decodes identity;
+			// a BGRA8 bake would need DecodeScale/DecodeBias here.
+            Pressure = Coarse.a - 0.5f;
+        }
+
+		// SPIRAL. cross(N, grad psi) runs along the contours of psi, so its
+		// streamlines circle a vortex and never approach or leave it. A
+		// component ALONG the gradient crosses contours instead, so the path
+		// spirals inward or outward by sign. Only meaningful because of the
+		// loop -- the spiral is a property of the path, and one step has no
+		// path. The tangential projection keeps it on the sphere; cross() got
+		// that for free, this does not.
+        const float3 GradTangent = Coarse.rgb - N * dot(N, Coarse.rgb);
+
+		// Swirl.y converts the baked gradient into an ANGULAR RATE.
+		//
+		// This is the unit fix. Decoded grad psi is normalized to fill [-1,1]
+		// and carries no physical scale whatever, while the jet profile is in
+		// radians per unit time. Nothing made those two commensurate, so the
+		// zonal term was being swamped by a factor of order a hundred and had
+		// to be compensated by hand. With this, both terms below are rates and
+		// their balance means something: cat's eyes form when the vortex turns
+		// at about the rate the shear strains it, so Swirl.y wants to sit near
+		// JetStrength.
+        const float3 EddyVelocity = (cross(N, Coarse.rgb) + GradTangent * Swirl.x) * Swirl.y;
+
+		// ZONAL SHEAR, exact rather than linearized.
+		//
+		// The previous form used du/dS times the latitude excursion, which is
+		// zero on the first iteration by construction and a fraction of one
+		// step on the second. The difference of the rates is the same quantity
+		// without the small-excursion assumption, costs the same, and is valid
+		// however far the path wanders.
+		//
+		// This is what puts the vortex INSIDE the shear layer. Simple shear
+		// alone has no closed streamlines and can only elongate a blob, which
+		// is why a stretched contour always ended in a rounded U -- that shape
+		// was structural, not an artifact. A vortex plus shear closes the
+		// streamlines into cat's eyes, and that is the billow shape a real
+		// filament makes when it turns back.
+		//
+		// cross(Z, Pos) points east and already carries cos(latitude), so it
+		// needs no normalizing and stays finite at the poles.
+        const float RateThere = GG_ZonalRate(Pos.z, BandCount, JetStrength, EquatorialBoost, Asymmetry, BandShape);
+
+        const float3 ZonalVelocity = cross(float3(0.0f, 0.0f, 1.0f), Pos) * (RateThere - RateHere);
+
+		// Renormalized every step because the displacement leaves the sphere.
+		// Only .z is read downstream, so a chord move would bias latitude, and
+		// over several steps it compounds.
+        Pos = normalize(Pos + (EddyVelocity + ZonalVelocity) * StepTime);
+    }
+
+    float3 Warped = Pos;
+
+	// Net displacement as a difference rather than a running sum: each step
+	// renormalizes, so the sum of the steps is not the distance travelled.
+    const float3 CoarseWarp = Warped - PCoarse;
+
+    float Ridge = 0.5f;
+    float3 DetailWarp = 0.0f;
+
+#if GG_DETAIL_OCTAVE
+
+	// -- Detail: reduced shear, inherits the coarse displacement -------------
+
+    float3 PDetail = GG_RotateZ(P, -(ThetaRigid + Differential * ShearTime * ShearFalloff.y));
+
+	// Inherits only a FRACTION of the coarse displacement, and this is the term
+	// that decides whether ShearFalloff.y appears to do anything at all.
+	//
+	// A displacement field with a large gradient IS strain, whatever it is
+	// called. Once the coarse layer is wound, its features are narrower by the
+	// shear factor and so grad(CoarseWarp) is large by exactly that factor.
+	// Inheriting it whole imposes an order-one strain on the fine layer no
+	// matter how little that layer was rotated, which buries its own falloff
+	// completely.
+	//
+	// Physically the fraction is right too. A small eddy is regenerated before
+	// it accumulates much strain, so it should be advected by a recent slice of
+	// the flow's history rather than the whole of it, and the accumulated warp
+	// is the whole of it.
+    PDetail = normalize(PDetail + CoarseWarp * ShearFalloff.w);
+
+	// Incommensurate drift rate so the layers never fall into a repeating beat.
+    const float3 DetailUVW = PDetail * Scales.y + Drift * (DriftTime * 2.3f);
+    const float4 DetailSample = DetailFlow.SampleLevel(DetailSampler, DetailUVW, 0.0f);
+
+    DetailWarp = cross(N, DetailSample.rgb) * (Warps.y * Turbulence);
+    Warped = normalize(Warped + DetailWarp);
+
+	// The independent alpha. Worley F2-F1 is MINIMAL on cell walls, so the
+	// filament network arrives dark and Ridge usually wants to be negative to
+	// make it read as bright wisps.
+    Ridge = DetailSample.a;
+#endif
+
+    float4 Packed = 0.5f;
+
+#if GG_PACKED_DETAIL
+
+	// -- Packed: least shear, rides both warps above -------------------------
+	//
+	// Sampled at a position carrying BOTH accumulated displacements, which is
+	// what makes this ride the flow rather than float over it as an unrelated
+	// layer. Its own shear is near zero, so it transports and deforms gently
+	// without ever winding tight enough to alias.
+
+    float3 PPacked = GG_RotateZ(P, -(ThetaRigid + Differential * ShearTime * ShearFalloff.z));
+	// Its OWN inheritance, separate from the detail layer's, and 0 is a
+	// legitimate setting rather than a degenerate one.
+	//
+	// This layer's job is to break the flow up into rounded organic shapes, and
+	// a shape that has been dragged through the flow field is no longer round.
+	// The other layers want to follow the flow because they ARE the flow; this
+	// one is chemistry riding on top of it, and reads better held rigid than
+	// stretched along with everything else.
+    PPacked = normalize(PPacked + (CoarseWarp + DetailWarp) * Scales.w);
+
+    const float3 PackedUVW = PPacked * Scales.z + Drift * (DriftTime * 0.7f);
+    Packed = PackedDetail.SampleLevel(PackedSampler, PackedUVW, 0.0f);
+#endif
+
+	// Zonal flow cannot disturb a latitude-only pattern, so all band meander
+	// comes from the warps above and this jitter -- never from JetStrength.
+    const float BandCoord = Warped.z + Warps.z * Pressure;
+
+    const float Band = GG_BandProfile(BandCoord, BandCount, Asymmetry, BandShape, BandSharpness);
+
+	// EDGE WEIGHTING, which is the other half of why detail read as grain.
+	//
+	// 4*B*(1-B) peaks at the half-way point of a band transition and falls to
+	// zero in a saturated zone or belt. Detail added uniformly is by definition
+	// grain: it has no relationship to the structure it sits on. Detail
+	// concentrated on the transitions ravels the band EDGES, which is where a
+	// real gas giant's billows and curls live and where this construction
+	// otherwise looks most obviously analytic.
+	//
+	// EdgeBias is how much survives in the flat interiors -- zero everywhere
+	// but the edges is its own kind of artificial.
+	// RELIEF THINNING.
+	//
+	// Shear stretches a parcel horizontally without adding material to it, so
+	// an incompressible parcel stretched by g in one direction and unchanged in
+	// the other must thin VERTICALLY by 1/g. Heavily wound regions therefore
+	// belong lower and flatter than unwound ones, and this is what the fluid
+	// would actually do rather than a correction applied to make it behave.
+	//
+	// Without it, filament width shrinks with winding while filament height
+	// does not, so the aspect ratio runs away and the march reads them as
+	// spikes -- fine at distance, sharp acute peaks up close. This is the term
+	// that keeps width and height falling together.
+	//
+	// Analytic and per-LATITUDE, not per-filament. That is a real limitation,
+	// but the winding here is driven by zonal shear and zonal shear is a
+	// function of latitude, so it captures nearly all of the variation.
+	//
+	// Normalized by the band frequency so the parameter stays O(1) rather than
+	// tracking whatever JetStrength and SpinUpTime happen to be: Winding reads
+	// as turns per band rather than radians per unit S.
+    const float Slope = GG_JetRawSlope(S, BandCount, Asymmetry);
+
+    const float Winding = abs(JetStrength * Slope * ShearTime * ShearFalloff.x)
+		/ max(BandCount * PI, 1e-3f);
+
+    const float ReliefScale = 1.0f / (1.0f + BandShape.z * Winding);
+
+    const float Edge = lerp(Detail.w, 1.0f, 4.0f * Band * (1.0f - Band));
+
+	// R against G as Perlin-Worley: the fluffy cloud-shape term. B stays raw as
+	// streaks, which want to look wispy rather than rounded.
+    const float Fluff = GG_PerlinWorley(Packed.r, Packed.g);
+
+    const float Modulation =
+		  Detail.x * (Ridge - 0.5f)
+		+ Detail.y * (Fluff - 0.5f)
+		+ Detail.z * (Packed.b - 0.5f);
+
+	// Pulled toward the neutral half rather than scaled, because Top is built
+	// as TopBase + BandRelief * (Band - 0.5). Collapsing toward 0.5 is exactly
+	// a reduction in relief, and it costs one lerp instead of another parameter
+	// threaded down to GG_CloudTop.
+    const float Composite = saturate(Band + Edge * Modulation);
+
+    return float4(
+		lerp(0.5f, Composite, ReliefScale),
+		Pressure,
+		Packed.a,
+		Packed.g);
+}
+
+/** Full evaluation. Six fetches: two phases of three.
+ *
+ *  The packed layer is inside the crossfade now. It has to be, because it is
+ *  sampled at a position that carries both warps, and those are per-phase. That
+ *  is also what fixed it reading as an unrelated grain overlay.
+ *
+ *  Returns:
+ *    x  Band brightness, composited. Feed through a colour ramp.
+ *    y  Pressure. Negative is a low, so cyclonic; extrema are vortex centres
+ *       and the circulation already matches them. Use it to tint spots.
+ *    z  Composition, large scale. For hue variation across the disc.
+ *    w  Storm cell mask. Discrete cells, for picking out individual features.
+ *
+ *  Scales        float4(Coarse, Detail, Packed, PackedWarpInherit)
+ *  Warps         float4(CoarseWarp, DetailWarp, BandJitter, TurbulenceFloor)
+ *  Detail        float4(Ridge, Mottle, Wisp, EdgeBias)
+ *  ShearFalloff  float4(Coarse, Detail, Packed, DetailWarpInherit) */
+float4 GG_GasGiant(
+	Texture3D CoarseFlow,
+	SamplerState CoarseSampler,
+	Texture3D DetailFlow,
+	SamplerState DetailSampler,
+	Texture3D PackedDetail,
+	SamplerState PackedSampler,
+	float3 LocalPos,
+	float PlanetRadius,
+	float Time,
+	float SpinUpTime,
+	float CrossfadePeriod,
+	float PhaseJitterAmount,
+	float RigidRate,
+	float3 Drift,
+	float4 Scales,
+	float4 Warps,
+	float4 Detail,
+	float4 ShearFalloff,
+	float BandCount,
+	float JetStrength,
+	float EquatorialBoost,
+	float Asymmetry,
+	float3 BandShape,
+	float BandSharpness,
+	float2 Swirl)
+{
+    const float3 P = LocalPos / max(PlanetRadius, 1e-4f);
+    const float3 N = normalize(P);
+    const float S = N.z;
+
+	// Static per-point offset, so regions sit at different points in their own
+	// winding cycle and the reset never happens planet-wide at once.
+    const float Jitter = GG_PhaseJitter(N) * PhaseJitterAmount;
+
+    const float Period = max(CrossfadePeriod, 1e-3f);
+    const float Cycle = Time / Period + Jitter;
+
+    const float Phase0 = frac(Cycle);
+    const float Phase1 = frac(Cycle + 0.5f);
+
+	// Weight of phase ONE. It peaks at 1 when Phase0 is at 0 or 1, exactly
+	// where phase 0 snaps from fully wound back to unwound, so phase 0
+	// contributes nothing there.
+    float Blend = abs(1.0f - 2.0f * Phase0);
+
+	// Smoothstep for C1. The raw triangle is continuous but its derivative
+	// flips sign instantly at the peak, and the eye reads that kink as a pop
+	// even when the values either side match.
+    Blend = Blend * Blend * (3.0f - 2.0f * Blend);
+
+	// SpinUpTime dominates both, which is what makes the two phases nearly
+	// identical in filament density and the reset nearly invisible.
+    float Shear0 = SpinUpTime + Phase0 * Period;
+    float Shear1 = SpinUpTime + Phase1 * Period;
+
+#if GG_SINGLE_PHASE
+	// Both phases identical, so the blend is a no-op and whatever remains is
+	// the field rather than the crossfade.
+	Shear1 = Shear0;
+#endif
+
+    const float4 Phase0Result = GG_EvaluatePhase(
+		CoarseFlow, CoarseSampler, DetailFlow, DetailSampler, PackedDetail, PackedSampler,
+		P, N, S, Shear0, Time, RigidRate, Drift, Scales, Warps, Detail, ShearFalloff,
+		BandCount, JetStrength, EquatorialBoost, Asymmetry, BandShape, BandSharpness, Swirl);
+
+    const float4 Phase1Result = GG_EvaluatePhase(
+		CoarseFlow, CoarseSampler, DetailFlow, DetailSampler, PackedDetail, PackedSampler,
+		P, N, S, Shear1, Time, RigidRate, Drift, Scales, Warps, Detail, ShearFalloff,
+		BandCount, JetStrength, EquatorialBoost, Asymmetry, BandShape, BandSharpness, Swirl);
+
+    float4 Result = lerp(Phase0Result, Phase1Result, Blend);
+
+#if GG_DEBUG_CROSSFADE
+	Result.x = Blend;
+#endif
+
+    return Result;
+}
+
+/** An authored vortex, added AFTER the shear rather than baked into the field
+ *  that gets sheared.
+ *
+ *  This is not a convenience. Kinematic shear has no mechanism to sustain a
+ *  vortex, so anything living inside the sheared field is eventually stretched
+ *  into a filament and lost. Real spots survive because the inverse cascade
+ *  feeds them continuously, and nothing here reproduces that. Exempting them
+ *  from the shear is the honest fake, and it gives the right look besides: the
+ *  spot persists while everything around it filaments past.
+ *
+ *  Centre is a unit direction. Drift its longitude by rotating Centre with
+ *  GG_RotateZ at the spot's own band rate before calling. */
+float GG_Spot(float3 N, float3 Centre, float Radius, float Strength)
+{
+    const float D = distance(N, normalize(Centre));
+
+    return Strength * exp(-(D * D) / max(Radius * Radius, 1e-6f));
+}
+
+// ---------------------------------------------------------------------------
+// Density
+//
+// COVERAGE IS 100% AND THAT SIMPLIFIES EVERYTHING.
+//
+// Terrestrial cloud shaders spend most of their complexity on coverage: where
+// is there cloud and where is there sky. A gas giant has no holes. There is no
+// threshold here, no coverage remap, no cloud/no-cloud decision. Density is
+// solid below the deck and falls off above it, and every visible feature is
+// RELIEF in that top surface rather than variation in opacity.
+//
+// WHICH IS WHY BAND DRIVES ALTITUDE, NOT OPACITY.
+//
+// Zones and belts are not bright and dark patches of the same material. They
+// are high and low cloud decks: a zone is a raised deck of fresh ammonia ice,
+// a belt is where the deck sits low and the line of sight reaches warmer,
+// darker material underneath. Brightness is the consequence. Feeding Band into
+// density would be modelling the symptom and would look flat under any lighting
+// model, because there would be no actual geometry for light to interact with.
+//
+// The useful side effect is that all the detail work -- ridges, mottling,
+// wisps, and the edge weighting that concentrates them on transitions -- lands
+// in the height field. Under a march it becomes surface relief along the cliffs
+// between decks, which is where a real gas giant's texture lives.
+//
+// COMPOSITION IS NOT A DENSITY TERM.
+//
+// Packed.a is a chemistry marker. It says what the material IS, not how much
+// of it there is, so it belongs in extinction or scattering colour, not in the
+// density field. It is passed straight through below rather than composited.
+// Folding it in would make chemically distinct regions physically thinner,
+// which is wrong and, worse, would look almost right.
+// ---------------------------------------------------------------------------
+
+/** Cloud top altitude, in fractions of the shell thickness.
+ *
+ *  Relief is float4(TopBase, BandRelief, PressureLift, StormTowers).
+ *
+ *  The pressure sign is not arbitrary. Anticyclones are high pressure, rising,
+ *  and condense fresh ammonia above the haze -- they are the bright ovals and
+ *  the Great Red Spot, and they must sit HIGH. Cyclones sink and expose deeper
+ *  material, so they must sit low. Getting this backwards produces a field that
+ *  reads as plausible until you notice every storm is a pit. */
+float GG_CloudTop(float4 Field, float4 Relief, float VortexThreshold)
+{
+    const float Band = Field.x;
+    const float Pressure = Field.y;
+    const float StormCells = Field.w;
+
+    float Top = Relief.x + Relief.y * (Band - 0.5f);
+
+    Top += Relief.z * Pressure;
+
+	// Convective towers, only where the circulation supports one. Ungated,
+	// Worley F1 is polka dots; gated on vortex strength it becomes storms that
+	// sit where the flow says they should. Inverted because F1 is minimal at
+	// cell CENTRES, which is where the tower belongs.
+    const float Vortex = smoothstep(VortexThreshold, 0.5f, abs(Pressure));
+    Top += Relief.w * (1.0f - StormCells) * Vortex;
+
+    return Top;
+}
+
+/** Density at a point in the shell.
+ *
+ *  LocalPos here carries its true radius, unlike everywhere else in this file.
+ *  The columnar field is evaluated at the normalized direction: the shell is
+ *  thin enough that sampling at the true radius would shift UVW by far less
+ *  than one lattice cell, so it would cost the same and change nothing.
+ *
+ *  Profile is float4(ShellThickness, TopSoftness, VortexThreshold, CoreRadius).
+ *
+ *  Returns:
+ *    x  Density in [0,1]. Multiply by an extinction coefficient in the march.
+ *    y  Composition, for scattering colour. NOT a density term.
+ *    z  Pressure, for tinting vortices.
+ *    w  Cloud top altitude, for debugging and for sphere-tracing the surface.
+ *
+ *  Note the march wants BandSharpness low -- around 0.8. High sharpness
+ *  saturates Band toward 0 and 1, which turns the height field into two flat
+ *  terraces joined by a cliff and throws away the relief this exists to
+ *  produce. Sharpness was doing the work of contrast back when the output was
+ *  brightness; here geometry does it instead. */
+float4 GG_Density(
+	Texture3D CoarseFlow,
+	SamplerState CoarseSampler,
+	Texture3D DetailFlow,
+	SamplerState DetailSampler,
+	Texture3D PackedDetail,
+	SamplerState PackedSampler,
+	float3 LocalPos,
+	float PlanetRadius,
+	float Time,
+	float SpinUpTime,
+	float CrossfadePeriod,
+	float PhaseJitterAmount,
+	float RigidRate,
+	float3 Drift,
+	float4 Scales,
+	float4 Warps,
+	float4 Detail,
+	float4 ShearFalloff,
+	float BandCount,
+	float JetStrength,
+	float EquatorialBoost,
+	float Asymmetry,
+	float3 BandShape,
+	float BandSharpness,
+	float2 Swirl,
+	float4 Relief,
+	float4 Profile)
+{
+    const float Radius = length(LocalPos);
+    const float3 Direction = LocalPos / max(Radius, 1e-4f);
+
+	// Shell fraction. 0 at the deck base, 1 at the top of the modelled shell.
+    const float Height = (Radius - PlanetRadius) / max(Profile.x, 1e-4f);
+
+    const float4 Field = GG_GasGiant(
+		CoarseFlow, CoarseSampler, DetailFlow, DetailSampler, PackedDetail, PackedSampler,
+		Direction * PlanetRadius, PlanetRadius,
+		Time, SpinUpTime, CrossfadePeriod, PhaseJitterAmount, RigidRate,
+		Drift, Scales, Warps, Detail, ShearFalloff,
+		BandCount, JetStrength, EquatorialBoost, Asymmetry, BandShape, BandSharpness, Swirl);
+
+    const float Top = GG_CloudTop(Field, Relief, Profile.z);
+
+	// Solid below the deck, fading above it. No lower bound is applied: the
+	// interior is opaque and never seen, and fading density toward the base
+	// would carve a hollow that only shows up as a wrong silhouette at the limb.
+	//
+	// Smoothstep rather than a linear ramp. The linear form is C0 at both ends,
+	// and those two kinks are visible as hard lines at the cloud top and at the
+	// point the deck goes solid -- the top one especially, since it is the
+	// silhouette. Softening the curve buys more apparent softness than raising
+	// TopSoftness does, and it costs nothing.
+    const float Softness = max(Profile.y, 1e-4f);
+    const float Density = 1.0f - smoothstep(Top - Softness, Top, Height);
+
+    return float4(Density, Field.z, Field.y, Top);
+}
+
+// ---------------------------------------------------------------------------
+// Raymarch
+//
+// A SHELL, NOT A BOX.
+//
+// NoiseVolumePreview marches a box, and the note at the top of that file
+// explains why: a tiling volume's domain is a cube and the seams it exists to
+// find sit on the faces. Neither reason survives here. This field is not being
+// validated for tiling, it is a spherical atmosphere, and the same file records
+// that the galaxy marcher it descended from used a sphere for exactly this
+// reason. So this goes back to a sphere, and specifically to a thin SHELL.
+//
+// THE SPAN IS ANALYTICALLY THIN, WHICH IS WHAT MAKES THIS AFFORDABLE.
+//
+// Each density sample here costs six texture fetches, against one for the box
+// marcher. Stepping the whole atmosphere at that price would be hopeless.
+//
+// It is not necessary. GG_CloudTop is a bounded expression: Band and Pressure
+// are both bounded, and the storm term is one-sided, so the highest and lowest
+// the deck can possibly reach are known in closed form from Relief alone. Above
+// TopMax there is provably nothing. Below TopMin minus the softness width,
+// density is provably saturated and the view can never reach further.
+//
+// So the only span worth marching is the thin band between those two radii,
+// and everything outside it is skipped without a single sample. This is the
+// same argument the baker's brick bounds make -- bound the field, then use the
+// bound to avoid sampling it -- applied to an analytic term rather than a baked
+// one, which makes it exact rather than conservative.
+//
+// The consequence is that step budget buys resolution of the CLOUD TOP rather
+// than of the atmosphere, which is the only thing visible at 100% coverage.
+// ---------------------------------------------------------------------------
+
+/** Interleaved gradient noise, from pixel coordinates.
+ *
+ *  Computed here rather than fed in, because the only thing a caller could
+ *  usefully supply is the pixel position, and it is already in scope at the
+ *  Custom node as Parameters.SvPosition. A separate node to produce this was a
+ *  node whose entire job was to be forgotten and left at a constant, which
+ *  silently disables the jitter and looks exactly like a marcher with too few
+ *  steps.
+ *
+ *  IGN rather than a hash: its output is decorrelated between neighbouring
+ *  pixels but low-discrepancy over any small block, so the error averages out
+ *  across a few pixels instead of turning into salt-and-pepper. That matters
+ *  because the thing being hidden is a sampling lattice, which is itself a
+ *  block-scale artifact.
+ *
+ *  Spatial only. Adding View.StateFrameIndexMod8 to the dot product gives a
+ *  temporally varying version, which is better under TAA and reads as flicker
+ *  without it. */
+float GG_Jitter(float2 PixelPos)
+{
+    return frac(52.9829189f * frac(dot(PixelPos, float2(0.06711056f, 0.00583715f))));
+}
+
+/** Ray against a sphere centred on the origin. Direction must be normalized.
+ *
+ *  Returns false when the ray misses. T0 may be negative, which means the
+ *  origin is inside; callers clamp rather than reject, since a camera inside
+ *  the shell is a normal case and not an error. */
+bool GG_RaySphere(float3 Origin, float3 Dir, float Radius, out float T0, out float T1)
+{
+    const float B = dot(Origin, Dir);
+    const float C = dot(Origin, Origin) - Radius * Radius;
+
+    const float Disc = B * B - C;
+
+    if (Disc < 0.0f)
+    {
+        T0 = 0.0f;
+        T1 = 0.0f;
+        return false;
+    }
+
+    const float S = sqrt(Disc);
+
+    T0 = -B - S;
+    T1 = -B + S;
+
+    return true;
+}
+
+/** Highest and lowest the deck can reach, in shell fractions.
+ *
+ *  Closed form, not a probe. Band lands in [0,1] so its centred form is bounded
+ *  by half its amplitude; Pressure is a normalized channel minus 0.5 and is
+ *  bounded the same way; the storm term is one-sided because both its gate and
+ *  its mask are non-negative.
+ *
+ *  Deliberately exact rather than padded. A loose bound here costs steps on
+ *  guaranteed-empty space, which is precisely what this exists to avoid. */
+void GG_TopBounds(float4 Relief, out float OutMin, out float OutMax)
+{
+    const float BandSpan = 0.5f * abs(Relief.y);
+    const float PressureSpan = 0.5f * abs(Relief.z);
+
+    OutMin = Relief.x - BandSpan - PressureSpan;
+    OutMax = Relief.x + BandSpan + PressureSpan + max(Relief.w, 0.0f);
+}
+
+/** Marches the cloud shell and integrates density.
+ *
+ *  InViewVec       Local camera vector, surface toward camera. CameraVector
+ *                  through TransformVector [World -> Local].
+ *  InCamPosLocal   Camera position in PLANET-LOCAL space, in the same units as
+ *                  PlanetRadius. This is the ray origin, so a wrong value moves
+ *                  the ray rather than merely biasing step size.
+ *
+ *  InDensityScale  Extinction multiplier. Because coverage is total, this wants
+ *                  to be high enough that the march saturates within a few
+ *                  steps of the deck; a low value produces a translucent planet
+ *                  that reads as fog rather than as cloud.
+ *
+ *  InStepBudget    A budget, not a count. See the note in NoiseVolumePreview.
+ *  InStepGrowth    Step growth across the marched span.
+ *  InMaxSteps      Safety bound. Set to int(StepBudget) + 8.
+ *  InPixelPos      Parameters.SvPosition.xy at the Custom node.
+ *  InJitterAmount  0 disables the jitter, 1 applies it fully. Anything in
+ *                  between mixes toward no offset.
+ *
+ *  Returns float4:
+ *    x  Cloud top altitude at the visible surface. THIS is the image to look
+ *       at. Note what is NOT returned: accumulated emission. For a uniformly
+ *       emitting medium the emission integral is identically 1 - Transmittance,
+ *       so it carries no structure whatever and is recoverable from y anyway.
+ *    y  Transmittance. 1 - this is opacity.
+ *    z  Composition, for scattering colour.
+ *    w  Pressure, for tinting vortices.
+ *
+ *  z and w are integrated against the same weights as the density itself, so
+ *  each is the expected value over what the ray actually sees rather than a
+ *  reading from an arbitrary step. That is what makes them usable as shading
+ *  inputs: at the limb, where a ray grazes many columns, a single-step reading
+ *  would flicker.
+ *
+ *  Packed into one float4 rather than returned through out parameters because
+ *  the Custom node's Additional Outputs have to be declared by hand in the
+ *  node's own array, and a mismatch there fails at shader compile with an
+ *  undeclared identifier rather than anywhere useful. Four channels is what a
+ *  single return can carry, and these are the four that matter. */
+float4 GG_March(
+	Texture3D CoarseFlow,
+	SamplerState CoarseSampler,
+	Texture3D DetailFlow,
+	SamplerState DetailSampler,
+	Texture3D PackedDetail,
+	SamplerState PackedSampler,
+	float3 InViewVec,
+	float3 InCamPosLocal,
+	float PlanetRadius,
+	float Time,
+	float SpinUpTime,
+	float CrossfadePeriod,
+	float PhaseJitterAmount,
+	float RigidRate,
+	float3 Drift,
+	float4 Scales,
+	float4 Warps,
+	float4 Detail,
+	float4 ShearFalloff,
+	float BandCount,
+	float JetStrength,
+	float EquatorialBoost,
+	float Asymmetry,
+	float3 BandShape,
+	float BandSharpness,
+	float2 Swirl,
+	float4 Relief,
+	float4 Profile,
+	float InDensityScale,
+	float InStepBudget,
+	float InStepGrowth,
+	int InMaxSteps,
+	float2 InPixelPos,
+	float InJitterAmount)
+{
+	// Miss value. Transmittance 1 means nothing was hit, which is what every
+	// early exit below wants to report.
+    const float4 Miss = float4(0.0f, 1.0f, 0.0f, 0.0f);
+
+    const float3 Origin = InCamPosLocal;
+    const float3 Dir = normalize(-InViewVec);
+
+    const float Thickness = max(Profile.x, 1e-4f);
+    const float Softness = max(Profile.y, 1e-4f);
+
+	// -- Shell bounds -------------------------------------------------------
+
+    float TopMin, TopMax;
+    GG_TopBounds(Relief, TopMin, TopMax);
+
+	// No margin above TopMax. Density is saturate((Top - Height)/Softness),
+	// which is exactly zero at Height == Top, so there is provably nothing
+	// there and padding it would only buy empty steps.
+    const float OuterRadius = PlanetRadius + Thickness * TopMax;
+
+	// Below this the field is saturated everywhere, so the ray can never see
+	// past it. It is the backstop, not a surface.
+	//
+	// Profile.w overrides it when positive, which is what you want once a solid
+	// core mesh is drawn inside: shrink this to sit just outside that mesh and
+	// the atmosphere stops where the surface begins, instead of at whatever
+	// radius the deck bound happened to imply.
+    const float DerivedInner = PlanetRadius + Thickness * max(TopMin - Softness, 0.0f);
+    const float InnerRadius = (Profile.w > 0.0f) ? Profile.w : DerivedInner;
+
+    float TEnter, TExit;
+    if (!GG_RaySphere(Origin, Dir, OuterRadius, TEnter, TExit))
+    {
+        return Miss;
+    }
+
+    if (TExit <= 0.0f)
+    {
+        return Miss;
+    }
+
+	// Camera inside the shell falls out of this clamp rather than needing its
+	// own branch, and it matters under a span-relative step rule: the stretch
+	// behind the viewer would otherwise be budgeted as if visible, spending
+	// steps on nothing AND coarsening everything that is not.
+    float TStart = max(TEnter, 0.0f);
+
+	// Clip against the opaque interior. Anything past the near intersection is
+	// fully dense by construction, so marching it would burn steps to confirm
+	// what the bound already guarantees.
+	//
+	// Hitting it must also terminate the ray OPAQUE. Clipping the span without
+	// zeroing transmittance is what produced a hard ring where grazing rays ran
+	// out of march before they ran out of medium -- the geometry stopped but the
+	// opacity did not, so the shell appeared to thin out against a boundary that
+	// is physically solid. Anything at or below this radius is saturated by
+	// construction, so the ray genuinely cannot see past it.
+    bool bHitCore = false;
+
+    float TInner0, TInner1;
+    if (GG_RaySphere(Origin, Dir, InnerRadius, TInner0, TInner1))
+    {
+        if (TInner0 > TStart)
+        {
+            TExit = min(TExit, TInner0);
+            bHitCore = true;
+        }
+    }
+
+    if (TExit <= TStart)
+    {
+        return Miss;
+    }
+
+	// -- Step sizing --------------------------------------------------------
+
+    const float Span = max(TExit - TStart, 1e-6f);
+    const float BaseStep = Span / max(InStepBudget, 1.0f);
+
+	// Step floor from the field rather than an authored distance. The finest
+	// structure along the ray is the deck's own transition width, since nothing
+	// resolves more finely than the softness over which density goes from zero
+	// to one. Half of that is the Nyquist limit and stepping below it resolves
+	// detail the field does not contain.
+	//
+	// This is the vertical limit. Horizontal detail is set by the texture
+	// scales and matters only at the limb, where the ray runs nearly tangent
+	// and crosses many columns per step -- which is also where step growth
+	// hurts most, so keep growth modest if the terminator looks banded.
+    const float MinStep = max(Thickness * Softness * 0.5f, 1e-5f);
+
+    const float Growth = max(InStepGrowth, 0.0f);
+    const float InvSpan = 1.0f / Span;
+
+	// Shortens the first step only, offsetting each pixel's lattice so the
+	// sampling grid does not read as banding. Costs no energy: the final step
+	// clamps to the exit, so total path length is unchanged.
+	//
+	// Lerped from 1 rather than used directly, so an amount of 0 means no
+	// offset at all rather than a zero-length first step.
+    const float Noise = GG_Jitter(InPixelPos);
+    const float FirstScale = clamp(lerp(1.0f, Noise, saturate(InJitterAmount)), 0.05f, 1.0f);
+
+	// -- March --------------------------------------------------------------
+
+    float Transmittance = 1.0f;
+    float Emission = 0.0f;
+    float Composition = 0.0f;
+    float Pressure = 0.0f;
+    float TopAccum = 0.0f;
+
+    float T = TStart;
+    float StepsTaken = 0.0f;
+
+	[loop]
+    for (int i = 0; i < InMaxSteps; i++)
+    {
+        const float Remaining = TExit - T;
+        if (Remaining <= 1e-6f)
+        {
+            break;
+        }
+
+		// Growth runs on progress along the span, not distance from the camera,
+		// which keeps the step count independent of where the viewer stands.
+        const float T01 = saturate((T - TStart) * InvSpan);
+
+        float StepLen = max(BaseStep * (1.0f + Growth * T01), MinStep);
+        if (i == 0)
+        {
+            StepLen *= FirstScale;
+        }
+        StepLen = min(StepLen, Remaining);
+
+        StepsTaken += 1.0f;
+
+		// Midpoint sample. With steps that grow, sampling at the near edge
+		// weights every interval by its own leading face and biases the
+		// integral toward the camera.
+        const float3 SamplePos = Origin + Dir * (T + StepLen * 0.5f);
+
+        const float4 Field = GG_Density(
+			CoarseFlow, CoarseSampler, DetailFlow, DetailSampler, PackedDetail, PackedSampler,
+			SamplePos, PlanetRadius,
+			Time, SpinUpTime, CrossfadePeriod, PhaseJitterAmount, RigidRate,
+			Drift, Scales, Warps, Detail, ShearFalloff,
+			BandCount, JetStrength, EquatorialBoost, Asymmetry, BandShape, BandSharpness, Swirl,
+			Relief, Profile);
+
+        const float Alpha = 1.0f - exp(-Field.x * InDensityScale * StepLen);
+        const float Weight = Alpha * Transmittance;
+
+        Emission += Weight;
+        Composition += Weight * Field.y;
+        Pressure += Weight * Field.z;
+        TopAccum += Weight * Field.w;
+
+        Transmittance *= 1.0f - Alpha;
+
+        if (Transmittance < 0.001f)
+        {
+            break;
+        }
+
+        T += StepLen;
+    }
+
+	// Normalize the integrated properties by the weight that produced them, so
+	// they stay in their own units instead of scaling with opacity. Guarded
+	// because a ray that grazed the shell without accumulating anything has no
+	// composition to report and must not divide by zero.
+	// The march stopped against the solid interior, so nothing gets through.
+    if (bHitCore)
+    {
+        Emission += Transmittance;
+        Transmittance = 0.0f;
+    }
+
+    const float TotalWeight = max(Emission, 1e-4f);
+
+    float TopOut = TopAccum / TotalWeight;
+
+#if GG_DEBUG_STEPS
+	TopOut = StepsTaken / max((float)InMaxSteps, 1.0f);
+#endif
+
+    return float4(
+		TopOut,
+		Transmittance,
+		Composition / TotalWeight,
+		Pressure / TotalWeight);
+}
