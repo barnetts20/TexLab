@@ -125,6 +125,11 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Bake Record")
 	TArray<FNoiseChannelNormalization> LastBakeNormalization;
 
+	/** Cross-channel vector facts from the most recent bake. Empty of meaning
+	 *  for a packed recipe; see FNoiseVectorFieldStats. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Bake Record")
+	FNoiseVectorFieldStats LastBakeVectorStats;
+
 	// -- Actions ------------------------------------------------------------
 
 	UFUNCTION(CallInEditor, Category = "Bake", meta = (DisplayName = "Bake Volume Texture"))
@@ -158,6 +163,19 @@ public:
 	 *  source symmetrically would strand the data in part of the range and waste
 	 *  the rest. Only the source knows which case it is. */
 	virtual bool IsChannelSourceSigned(int32 ChannelIndex) const { return false; }
+
+	/** True when RGB is one vector rather than three independent scalars.
+	 *
+	 *  Asked rather than inferred from the normalization groups, because a
+	 *  packed recipe is free to group three channels for reasons of its own
+	 *  without those channels being a vector, and the difference decides
+	 *  whether a magnitude statistic means anything. */
+	virtual bool IsVectorField() const { return false; }
+
+	/** True when A holds the scalar potential whose gradient is in RGB, from
+	 *  the same evaluation. Lets the probe record the conversion between the
+	 *  two normalizations; see FNoiseVectorFieldStats. */
+	virtual bool IsAlphaGradientPotential() const { return false; }
 
 	/** Runs every shared validation rule, then ValidateDerived.
 	 *  Returns false and fills OutError on the first failure. */

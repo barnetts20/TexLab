@@ -80,6 +80,7 @@ private:
 		const UNoiseBakeRecipeBase& Recipe,
 		FNoiseBakeDispatchParams& InOutParams,
 		TArray<FNoiseChannelNormalization>& OutNormalization,
+		FNoiseVectorFieldStats& OutVectorStats,
 		FString& OutError);
 
 	static bool RunTilingSelfTest(

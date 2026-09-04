@@ -1,5 +1,30 @@
 #include "NoiseBakeTypes.h"
 
+int32 FNoiseChannelRecipe::GetEffectiveOctaves(int32 Resolution) const
+{
+	const int32 MaxOctaves = NoiseBakeValidation::GetMaxOctaves(
+		Resolution, GetBasePeriod(), Lacunarity);
+
+	if (MaxOctaves == 0)
+	{
+		return 0;
+	}
+
+	return FMath::Clamp(Octaves, 1, MaxOctaves);
+}
+
+int32 FNoiseChannelRecipe::GetFinestPeriod(int32 Resolution) const
+{
+	int32 Period = GetBasePeriod();
+
+	for (int32 i = 1; i < FMath::Max(GetEffectiveOctaves(Resolution), 1); ++i)
+	{
+		Period *= FMath::Max(Lacunarity, 2);
+	}
+
+	return Period;
+}
+
 namespace NoiseBakeValidation
 {
 	bool ValidateResolution(int32 Resolution, FString& OutError)
@@ -81,17 +106,18 @@ namespace NoiseBakeValidation
 			return false;
 		}
 
-		if (Channel.Octaves > MaxOctaves)
-		{
-			OutError = FString::Printf(
-				TEXT("%s: %d octaves at base period %d and lacunarity %d lays %d cells across the volume ")
-				TEXT("at the finest octave, which needs %d voxels of resolution. The volume is %d^3, so the ")
-				TEXT("maximum here is %d octaves."),
-				ChannelName, Channel.Octaves, BasePeriod, Channel.Lacunarity,
-				Channel.GetFinestPeriod(), Channel.GetFinestPeriod() * MinVoxelsPerFinestCell,
-				Resolution, MaxOctaves);
-			return false;
-		}
+		// Deliberately NOT an error when the request exceeds MaxOctaves.
+		//
+		// The octave count is a request for detail, and the honest response to
+		// asking for more than fits is to give as much as fits. Rejecting made
+		// the count a value that had to be recomputed by hand every time the
+		// resolution changed, which meant a recipe that baked at 256 would fail
+		// at 128 for a reason that has nothing to do with what was authored.
+		//
+		// The clamp happens in GetEffectiveOctaves and is logged once per bake
+		// where the value is consumed, so it is visible without being an
+		// obstacle. The zero case above stays fatal because no octave count
+		// rescues a base period that will not fit on its own.
 
 		if (Channel.NormalizeMode == ENoiseNormalizeMode::Manual &&
 			Channel.ManualMax - Channel.ManualMin < KINDA_SMALL_NUMBER)

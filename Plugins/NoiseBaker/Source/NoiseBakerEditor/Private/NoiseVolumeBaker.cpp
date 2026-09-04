@@ -105,10 +105,26 @@ void FNoiseVolumeBaker::BuildDispatchParams(const UNoiseBakeRecipeBase& Recipe, 
 
 		OutParams.ChannelParamsA[Index] = FVector4f(C.Gain, C.WorleyJitter, C.WorleySmoothness, 0.0f);
 
+		// Effective, not authored. Validation now clamps rather than rejects, so
+		// this is the single place the clamp becomes real -- packing the
+		// requested count here would let a recipe pass validation and then bake
+		// an aliased finest octave anyway, which is a worse failure than the
+		// rejection it replaced.
+		const int32 EffectiveOctaves = FMath::Max(C.GetEffectiveOctaves(Recipe.Resolution), 1);
+
+		if (EffectiveOctaves < C.Octaves)
+		{
+			UE_LOG(LogNoiseVolumeBaker, Log,
+				TEXT("Channel %d: %d octaves requested, %d baked. Base period %d at lacunarity %d "
+					"cannot carry more at %d^3."),
+				Index, C.Octaves, EffectiveOctaves, C.GetBasePeriod(), FMath::Max(C.Lacunarity, 2),
+				Recipe.Resolution);
+		}
+
 		OutParams.ChannelParamsB[Index] = FIntVector4(
 			(int32)C.Basis,
 			C.GetBasePeriod(),
-			FMath::Max(C.Octaves, 1),
+			EffectiveOctaves,
 			FMath::Max(C.Lacunarity, 2));
 
 		const int32 Flags = C.bRidged ? NoiseBakeInternal::FlagRidged : 0;
@@ -316,6 +332,7 @@ bool FNoiseVolumeBaker::RunProbePass(
 	const UNoiseBakeRecipeBase& Recipe,
 	FNoiseBakeDispatchParams& InOutParams,
 	TArray<FNoiseChannelNormalization>& OutNormalization,
+	FNoiseVectorFieldStats& OutVectorStats,
 	FString& OutError)
 {
 	TArray<FNoiseChannelRecipe> Channels;
@@ -323,11 +340,25 @@ bool FNoiseVolumeBaker::RunProbePass(
 
 	OutNormalization.SetNum(4);
 
+	OutVectorStats = FNoiseVectorFieldStats();
+	OutVectorStats.bIsVectorField = Recipe.IsVectorField();
+
 	const bool bNeedsProbe = Channels.ContainsByPredicate(
 		[](const FNoiseChannelRecipe& C) { return C.NormalizeMode == ENoiseNormalizeMode::AutoProbe; });
 
 	float ObservedMin[4] = { TNumericLimits<float>::Max(), TNumericLimits<float>::Max(), TNumericLimits<float>::Max(), TNumericLimits<float>::Max() };
 	float ObservedMax[4] = { TNumericLimits<float>::Lowest(), TNumericLimits<float>::Lowest(), TNumericLimits<float>::Lowest(), TNumericLimits<float>::Lowest() };
+
+	// Vector magnitude statistics, accumulated in the same walk as the ranges.
+	//
+	// Doubles because the probe is up to 128^3 and a float sum of two million
+	// terms loses the tail: once the running total is large enough, adding a
+	// typical magnitude to it rounds to no change at all. The extremes are
+	// immune to this, which is part of why they were never a substitute.
+	double MagnitudeSum = 0.0;
+	double MagnitudeSqSum = 0.0;
+	double MagnitudeMax = 0.0;
+	int64 MagnitudeCount = 0;
 
 	if (bNeedsProbe)
 	{
@@ -343,10 +374,26 @@ bool FNoiseVolumeBaker::RunProbePass(
 		ProbeParams.ShapeStage = ENoiseShapeStage::Raw; // raw FBM output
 		ProbeParams.DomainOffset = FVector3f::ZeroVector;
 
-		auto Accumulate = [&ObservedMin, &ObservedMax](const TArray<FVector4f>& Slab, int32, int32)
+		auto Accumulate = [&ObservedMin, &ObservedMax,
+			&MagnitudeSum, &MagnitudeSqSum, &MagnitudeMax, &MagnitudeCount]
+			(const TArray<FVector4f>& Slab, int32, int32)
 			{
 				for (const FVector4f& Texel : Slab)
 				{
+					// Raw, in UVW units. The probe runs at ShapeStage::Raw, so
+					// this is the field's own magnitude rather than a
+					// post-normalization number that would be near 1 by
+					// construction and tell you nothing.
+					const double Magnitude = (double)FMath::Sqrt(
+						(double)Texel.X * Texel.X +
+						(double)Texel.Y * Texel.Y +
+						(double)Texel.Z * Texel.Z);
+
+					MagnitudeSum += Magnitude;
+					MagnitudeSqSum += Magnitude * Magnitude;
+					MagnitudeMax = FMath::Max(MagnitudeMax, Magnitude);
+					MagnitudeCount++;
+
 					ObservedMin[0] = FMath::Min(ObservedMin[0], Texel.X);
 					ObservedMin[1] = FMath::Min(ObservedMin[1], Texel.Y);
 					ObservedMin[2] = FMath::Min(ObservedMin[2], Texel.Z);
@@ -506,6 +553,76 @@ bool FNoiseVolumeBaker::RunProbePass(
 		OutNormalization[Index].NormalizationGroup = C.NormalizationGroup;
 		OutNormalization[Index].bBipolar = C.bBipolarOutput;
 		OutNormalization[Index].DistributionMode = C.DistributionMode;
+	}
+
+	// -- Vector field statistics --------------------------------------------
+	//
+	// Everything below is recorded, never applied. It changes no baked value.
+
+	if (MagnitudeCount > 0)
+	{
+		OutVectorStats.bMagnitudesMeasured = true;
+		OutVectorStats.MeanMagnitude = (float)(MagnitudeSum / (double)MagnitudeCount);
+		OutVectorStats.RmsMagnitude = (float)FMath::Sqrt(MagnitudeSqSum / (double)MagnitudeCount);
+		OutVectorStats.MaxMagnitude = (float)MagnitudeMax;
+
+		if (OutVectorStats.bIsVectorField)
+		{
+			UE_LOG(LogNoiseVolumeBaker, Log,
+				TEXT("Vector magnitude (raw, UVW): mean %.6f, rms %.6f, max %.6f, rms/mean %.3f"),
+				OutVectorStats.MeanMagnitude, OutVectorStats.RmsMagnitude, OutVectorStats.MaxMagnitude,
+				OutVectorStats.RmsMagnitude / FMath::Max(OutVectorStats.MeanMagnitude, KINDA_SMALL_NUMBER));
+		}
+	}
+
+	if (Recipe.IsAlphaGradientPotential())
+	{
+		// Undo the RGB pipeline analytically to recover the raw gradient, then
+		// re-apply the alpha channel's scale, which is what differentiating the
+		// decoded alpha would have produced.
+		//
+		//   DecodedRGB = (RawGrad * Sg + Bg) * Py + Pz
+		//   DecodedA   =  RawF    * Sa + Ba
+		//
+		// and RawGrad is the gradient of RawF, so
+		//
+		//   grad(DecodedA) = Sa * RawGrad
+		//                  = (Sa/Sg) * ((DecodedRGB - Pz)/Py - Bg)
+		//
+		// which is one multiply and one add against DecodedRGB. Only valid
+		// because both channels are forced to DistributionMode::None: a
+		// redistribution on either one is nonlinear and no constant pair could
+		// express the relationship afterwards.
+		const FNoiseChannelNormalization& G = OutNormalization[0];
+		const FNoiseChannelNormalization& A = OutNormalization[3];
+
+		const float PolarityScale = G.bBipolar ? 2.0f : 1.0f;
+		const float PolarityBias = G.bBipolar ? -1.0f : 0.0f;
+
+		const float ScaleRatio = A.Scale / FMath::Max(G.Scale, KINDA_SMALL_NUMBER);
+
+		OutVectorStats.bAlphaIsGradientPotential = true;
+		OutVectorStats.PotentialGradientScale = ScaleRatio / PolarityScale;
+		OutVectorStats.PotentialGradientOffset = ScaleRatio * (-PolarityBias / PolarityScale - G.Bias);
+
+		UE_LOG(LogNoiseVolumeBaker, Log,
+			TEXT("Potential/gradient conversion: grad(A) = %.6f * RGB + %.6f"),
+			OutVectorStats.PotentialGradientScale, OutVectorStats.PotentialGradientOffset);
+
+		// A nonzero offset is a constant vector added to every voxel of the
+		// field, which is a planet-wide drift in a flow consumer and is
+		// invisible in any preview that shows direction. It cannot arise from
+		// AutoProbe on a signed source, which centres the range by
+		// construction, so reaching here means a Manual range was authored
+		// asymmetrically.
+		if (FMath::Abs(OutVectorStats.PotentialGradientOffset) > KINDA_SMALL_NUMBER)
+		{
+			UE_LOG(LogNoiseVolumeBaker, Warning,
+				TEXT("VectorField bake: RGB range [%.6f, %.6f] is not centred on zero, so the field "
+					"carries a constant offset of %.6f. Centre the Manual range, or switch the "
+					"potential to AutoProbe, unless the drift is intended."),
+				G.ObservedMin, G.ObservedMax, OutVectorStats.PotentialGradientOffset);
+		}
 	}
 
 	// -- Distribution probe -------------------------------------------------
@@ -988,6 +1105,7 @@ bool FNoiseVolumeBaker::WriteTexture(
 	UserData->Resolution = Resolution;
 	UserData->OutputFormat = Recipe.OutputFormat;
 	UserData->ChannelNormalization = Normalization;
+	UserData->VectorFieldStats = Recipe.LastBakeVectorStats;
 
 	TArray<FNoiseChannelRecipe> Channels;
 	Recipe.GetChannels(Channels);
@@ -1079,7 +1197,8 @@ bool FNoiseVolumeBaker::Bake(UNoiseBakeRecipeBase* Recipe, FString& OutError)
 	Progress.EnterProgressFrame(0.25f, LOCTEXT("Probing", "Probing value range"));
 
 	TArray<FNoiseChannelNormalization> Normalization;
-	if (!RunProbePass(*Recipe, Params, Normalization, OutError))
+	FNoiseVectorFieldStats VectorStats;
+	if (!RunProbePass(*Recipe, Params, Normalization, VectorStats, OutError))
 	{
 		return false;
 	}
@@ -1137,6 +1256,7 @@ bool FNoiseVolumeBaker::Bake(UNoiseBakeRecipeBase* Recipe, FString& OutError)
 	Recipe->LastBakeGuid = FGuid::NewGuid();
 	Recipe->BakeVersion++;
 	Recipe->LastBakeNormalization = Normalization;
+	Recipe->LastBakeVectorStats = VectorStats;
 
 	UVolumeTexture* Texture = ResolveOrCreateTexture(*Recipe, OutError);
 	if (!Texture)

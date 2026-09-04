@@ -143,6 +143,18 @@ bool UVectorFieldBakeRecipe::IsChannelSourceSigned(int32 ChannelIndex) const
 	return ChannelIndex >= 0 && ChannelIndex <= 2;
 }
 
+bool UVectorFieldBakeRecipe::IsAlphaGradientPotential() const
+{
+	// Both conditions are load-bearing. Gradient mode is what makes RGB the
+	// gradient of channel 0's potential, and ScalarPotential alpha is what puts
+	// that same potential in A -- the shader evaluates EvalChannelRaw(0) for
+	// both, so the two are exactly consistent before normalization separates
+	// them. Curl mode fails the first test and ValidateDerived already rejects
+	// the combination outright.
+	return Mode == ENoiseVectorFieldMode::Gradient
+		&& AlphaMode == ENoiseVectorAlphaMode::ScalarPotential;
+}
+
 bool UVectorFieldBakeRecipe::ValidateDerived(FString& OutError) const
 {
 	if (Mode == ENoiseVectorFieldMode::Curl && AlphaMode == ENoiseVectorAlphaMode::ScalarPotential)
@@ -158,8 +170,8 @@ bool UVectorFieldBakeRecipe::ValidateDerived(FString& OutError) const
 	{
 		OutError = FString::Printf(
 			TEXT("EpsilonVoxels is %.4f. Below about 0.05 the central difference subtracts two nearly "
-				 "equal FBM values and the result is dominated by float cancellation rather than by the "
-				 "field."),
+				"equal FBM values and the result is dominated by float cancellation rather than by the "
+				"field."),
 			EpsilonVoxels);
 		return false;
 	}
@@ -169,14 +181,17 @@ bool UVectorFieldBakeRecipe::ValidateDerived(FString& OutError) const
 	// and the step is EpsilonVoxels/Resolution. Stepping across a whole cell
 	// differences unrelated parts of the field rather than measuring a slope.
 	const float EpsilonUVW = EpsilonVoxels / (float)FMath::Max(Resolution, 1);
-	const float FinestCellUVW = 1.0f / (float)FMath::Max(Potential.GetFinestPeriod(), 1);
+	// Resolution-aware, so the epsilon is checked against the octaves that will
+	// actually be baked. Using the authored count would reject an epsilon for
+	// failing to resolve detail the clamp is about to discard anyway.
+	const float FinestCellUVW = 1.0f / (float)FMath::Max(Potential.GetFinestPeriod(Resolution), 1);
 
 	if (EpsilonUVW > FinestCellUVW * 0.5f)
 	{
 		OutError = FString::Printf(
 			TEXT("EpsilonVoxels %.4f is %.1f%% of the finest octave's cell size. The central difference "
-				 "would span a significant fraction of a lattice cell and smooth away the detail the "
-				 "octave count is paying for. Reduce EpsilonVoxels, reduce Octaves, or raise Resolution."),
+				"would span a significant fraction of a lattice cell and smooth away the detail the "
+				"octave count is paying for. Reduce EpsilonVoxels, reduce Octaves, or raise Resolution."),
 			EpsilonVoxels, 100.0f * EpsilonUVW / FinestCellUVW);
 		return false;
 	}
@@ -187,9 +202,9 @@ bool UVectorFieldBakeRecipe::ValidateDerived(FString& OutError) const
 	{
 		UE_LOG(LogTemp, Warning,
 			TEXT("VectorFieldBakeRecipe '%s': Gain %.2f x Lacunarity %d = %.2f. Differentiation "
-				 "multiplies each octave by its frequency, so the output's octave amplitudes fall as "
-				 "(Gain x Lacunarity)^i. At 1.0 or above the finest octave dominates and the field reads "
-				 "as static. Try Gain %.2f."),
+				"multiplies each octave by its frequency, so the output's octave amplitudes fall as "
+				"(Gain x Lacunarity)^i. At 1.0 or above the finest octave dominates and the field reads "
+				"as static. Try Gain %.2f."),
 			*GetName(), Potential.Gain, Potential.Lacunarity, EffectiveFalloff,
 			0.5f / (float)FMath::Max(Potential.Lacunarity, 2));
 	}

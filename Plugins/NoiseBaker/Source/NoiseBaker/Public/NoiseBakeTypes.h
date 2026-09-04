@@ -266,8 +266,17 @@ struct NOISEBAKER_API FNoiseChannelRecipe
 	ENoiseBasePeriod BasePeriod = ENoiseBasePeriod::P4;
 
 	/** Number of FBM octaves. Each octave multiplies the period by Lacunarity,
-	 *  so octave count is bounded by resolution (see the Nyquist rule in
-	 *  ValidateChannel). */
+	 *  so octave count is bounded by resolution.
+	 *
+	 *  This is a REQUEST, not a guarantee. The bake clamps it to whatever the
+	 *  resolution can actually carry, so setting it to the maximum is a valid
+	 *  way of asking for as much detail as fits, and a recipe stays bakeable
+	 *  when the resolution is later lowered. GetEffectiveOctaves is the value
+	 *  the shader receives; the clamp is logged whenever it binds so it is
+	 *  never silent.
+	 *
+	 *  Only a base period too large to fit even one octave is still an error,
+	 *  because there is no count that rescues it. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Basis", meta = (ClampMin = "1", ClampMax = "10", UIMin = "1", UIMax = "8"))
 	int32 Octaves = 4;
 
@@ -394,8 +403,12 @@ struct NOISEBAKER_API FNoiseChannelRecipe
 		return FMath::Max((int32)BasePeriod, 1);
 	}
 
-	/** Lattice cells across the tile at the finest octave. This is the number
-	 *  that governs aliasing. */
+	/** Lattice cells across the tile at the finest octave, using the AUTHORED
+	 *  octave count. This is the number that governs aliasing.
+	 *
+	 *  Prefer the resolution-aware overload anywhere the answer feeds a real
+	 *  decision. This one reports what was asked for, which after clamping may
+	 *  not be what gets baked. */
 	int32 GetFinestPeriod() const
 	{
 		int32 Period = GetBasePeriod();
@@ -405,6 +418,21 @@ struct NOISEBAKER_API FNoiseChannelRecipe
 		}
 		return Period;
 	}
+
+	/** Octaves actually baked at this resolution: the authored count clamped to
+	 *  the Nyquist limit.
+	 *
+	 *  Returns 0 when the base period alone will not fit, which no octave count
+	 *  can fix and which validation still rejects outright.
+	 *
+	 *  Out of line because it needs GetMaxOctaves, which is declared below.
+	 *  No NOISEBAKER_API here: the struct already carries it, and repeating the
+	 *  macro on a member of an exported class is an error rather than a
+	 *  redundancy. */
+	int32 GetEffectiveOctaves(int32 Resolution) const;
+
+	/** Finest period as actually baked at this resolution. */
+	int32 GetFinestPeriod(int32 Resolution) const;
 };
 
 /** Per-channel normalization and encoding actually applied during a bake.
@@ -479,6 +507,99 @@ struct NOISEBAKER_API FNoiseChannelNormalization
 	int32 NormalizationGroup = 0;
 };
 
+/** Cross-channel facts about a vector bake that no single channel's
+ *  normalization can express.
+ *
+ *  Everything here is measured or derived at bake time and is read-only. None
+ *  of it changes what gets baked; it exists because two things a consumer needs
+ *  are not recoverable from the texture alone.
+ *
+ *  THE POTENTIAL/GRADIENT RELATIONSHIP.
+ *
+ *  In a Gradient bake with a Scalar Potential alpha, RGB holds grad f and A
+ *  holds f, from the same evaluation of the same potential. They are normalized
+ *  SEPARATELY, and they have to be: a gradient's range and its potential's range
+ *  are unrelated, so sharing a normalization group would strand one of them in a
+ *  fraction of the storage range.
+ *
+ *  The cost of that is that the decoded RGB is no longer the gradient of the
+ *  decoded A. It is off by a constant, and the constant is what these two
+ *  fields record:
+ *
+ *      grad(DecodedA) = PotentialGradientScale * DecodedRGB + PotentialGradientOffset
+ *
+ *  A consumer that only warps by the flow never needs this. A consumer that
+ *  builds a COMPOSITE potential -- adding its own analytic term to A and taking
+ *  the gradient of the sum -- does, because the chain rule produces terms that
+ *  multiply A against RGB and the two must be in the same units before they can
+ *  be added. Getting it wrong yields a field that looks entirely plausible and
+ *  whose circulation does not match its own scalar.
+ *
+ *  The offset is zero whenever the RGB range is symmetric about zero, which is
+ *  every AutoProbe bake of a signed source. It goes nonzero only under a Manual
+ *  range that is not centred, where it records the constant drift that choice
+ *  introduced into the field.
+ *
+ *  THE MAGNITUDE STATISTICS.
+ *
+ *  Normalization records the observed extremes, which is what it needs to build
+ *  a scale, and the extremes are close to useless for choosing a warp amplitude:
+ *  they describe the single most violent voxel in the volume rather than what
+ *  the field typically does. Mean and RMS of the vector magnitude are what that
+ *  choice actually wants, and once recorded they make bakes comparable, so a
+ *  re-bake at a different resolution or octave count can be retuned by ratio
+ *  instead of by eye.
+ *
+ *  Magnitudes are of the RAW field in UVW units, before normalization. That is
+ *  deliberate: post-normalization magnitudes are always near the same number by
+ *  construction, so they would carry no information about the field at all. */
+USTRUCT(BlueprintType)
+struct NOISEBAKER_API FNoiseVectorFieldStats
+{
+	GENERATED_BODY()
+
+	/** False for a packed bake, or any bake whose RGB is not a single vector.
+	 *  Nothing else in this struct is meaningful when this is false. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Vector Field")
+	bool bIsVectorField = false;
+
+	/** True when RGB is the gradient of the potential stored in A, so the two
+	 *  conversion factors below are populated and exact. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Potential")
+	bool bAlphaIsGradientPotential = false;
+
+	/** See the struct comment. Multiply decoded RGB by this to put it in the
+	 *  same units as the gradient of decoded A. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Potential")
+	float PotentialGradientScale = 1.0f;
+
+	/** Added after the scale. Zero for any centred range. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Potential")
+	float PotentialGradientOffset = 0.0f;
+
+	/** Mean |RGB| over the probe, raw, in UVW units. The number to calibrate a
+	 *  warp amplitude against. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Magnitude")
+	float MeanMagnitude = 0.0f;
+
+	/** Root mean square |RGB|. Above the mean by an amount that grows with how
+	 *  peaky the field is, so the RMS/mean ratio is a usable read on whether
+	 *  the octave settings have produced structure or spikes. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Magnitude")
+	float RmsMagnitude = 0.0f;
+
+	/** Largest |RGB| the probe saw. Undersampled by definition, so treat it as
+	 *  a floor on the true maximum rather than the maximum. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Magnitude")
+	float MaxMagnitude = 0.0f;
+
+	/** False when no range probe ran, which happens when every channel is on a
+	 *  Manual or None normalize mode. The magnitude fields are zero in that
+	 *  case, and zero is not a measurement. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Magnitude")
+	bool bMagnitudesMeasured = false;
+};
+
 /** Conservative per-brick bounds over the baked volume, one min/max pair per
  *  channel per brick.
  *
@@ -524,6 +645,12 @@ public:
 	/** Normalization and encoding applied per channel, in RGBA order. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Bake")
 	TArray<FNoiseChannelNormalization> ChannelNormalization;
+
+	/** Cross-channel vector facts. Carried on the texture as well as the recipe
+	 *  so a consumer that only has the asset can still recover them; a recipe
+	 *  can be edited or deleted after the bake, the texture cannot drift. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Bake")
+	FNoiseVectorFieldStats VectorFieldStats;
 
 	/** Voxels per brick edge. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Acceleration")

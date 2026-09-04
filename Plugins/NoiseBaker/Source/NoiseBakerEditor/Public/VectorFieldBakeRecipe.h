@@ -82,6 +82,8 @@ public:
 	virtual void GetChannels(TArray<FNoiseChannelRecipe>& OutChannels) const override;
 	virtual void ConfigureEvaluation(FNoiseBakeDispatchParams& InOutParams) const override;
 	virtual bool IsChannelSourceSigned(int32 ChannelIndex) const override;
+	virtual bool IsVectorField() const override { return true; }
+	virtual bool IsAlphaGradientPotential() const override;
 
 protected:
 	virtual bool ValidateDerived(FString& OutError) const override;
