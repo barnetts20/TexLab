@@ -452,10 +452,45 @@ void MainVelocityCS(uint3 Id : SV_DispatchThreadID)
         return;
     }
 
-    float Psi;
-    const float3 Velocity = SimVelocity(SimPsiSRV, int2(Id.xy), Id.z, Psi);
+    const int2 C = int2(Id.xy);
+    const uint Layer = Id.z;
 
-    SimVelocityUAV[int3(Id)] = float4(Velocity, Psi);
+    const float DLon = (2.0f * PI) * SimInvGridSize.x;
+    const float DMu = 2.0f * SimInvGridSize.y;
+
+    const float Lon = SimColumnToLon((float) C.x);
+    const float Mu = SimRowToMu((float) C.y);
+    const float CosPhi = sqrt(1.0f - Mu * Mu);
+
+	// Taps inline rather than through a shared helper. There is exactly one
+	// consumer of the streamfunction gradient, so a helper in the common header
+	// would be a second entry point that nothing calls -- and the last one that
+	// existed had to be deleted for precisely that reason.
+    const float Psi = SimLoad(SimPsiSRV, C, Layer);
+
+    const float West = SimLoad(SimPsiSRV, C + int2(-1, 0), Layer);
+    const float East = SimLoad(SimPsiSRV, C + int2(1, 0), Layer);
+    const float South = SimLoad(SimPsiSRV, C + int2(0, -1), Layer);
+    const float North = SimLoad(SimPsiSRV, C + int2(0, 1), Layer);
+
+	// u = N x grad(psi), which on the sphere gives
+	//     u_east  = -cos(phi) dpsi/dmu
+	//     u_north =  (1/cos(phi)) dpsi/dlambda
+	//
+	// Centred differences, both through SimWrapCoord, so the longitude one is
+	// correct at the seam and the mu one is one-sided across the pole by way of
+	// the mirror -- which is the right thing there, since the mirrored value is
+	// the real field on the far side rather than a boundary approximation.
+	//
+	// The 1/cos(phi) on the north component is the one genuinely singular term
+	// in the velocity. It is bounded on a cell-centred grid and bounded further
+	// by the zonal filter, which is what keeps it off the CFL at high latitude.
+    const float UEast = -CosPhi * ((North - South) / (2.0f * DMu));
+    const float UNorth = ((East - West) / (2.0f * DLon)) / CosPhi;
+
+    const float3 Velocity = SimEast(Lon) * UEast + SimNorth(Lon, Mu) * UNorth;
+
+    SimVelocityUAV[int3(C, Layer)] = float4(Velocity, Psi);
 }
 
 // ---------------------------------------------------------------------------
@@ -687,7 +722,25 @@ void MainForceCS(uint3 Id : SV_DispatchThreadID)
 		+ SimForcingDrift * SimTime
 		+ float3(0.13f, 0.29f, 0.71f) * (float) Layer;
 
-    Omega += SimForcingAmplitude * Profile.z * SimDeltaTime * SimSampleSeed(ForcingUVW, SimForcingChannel);
+	// FORCING AMPLITUDE IS AN EQUILIBRIUM, NOT A RATE.
+	//
+	// This is a forced-dissipative balance. With a slowly varying forcing F and
+	// linear drag, d(omega)/dt = F - Drag*omega settles at omega = F/Drag, so a
+	// raw amplitude sets the eddy strength only in combination with the drag --
+	// and drag is the primary handle for arresting the cascade, so every time
+	// it is touched the eddies silently retune.
+	//
+	// Multiplying by the drag rate here cancels that: the parameter becomes the
+	// equilibrium eddy vorticity directly, and stays put while drag is tuned.
+	// Compare it against the zonal vorticity scale, roughly
+	// JetStrength * 0.69 * BandCount * pi, which is what the bands are made of.
+	//
+	// Consequence worth knowing: at DragRate zero there is no forcing, because
+	// there is no equilibrium to aim at. That is the honest answer rather than
+	// an edge case -- unforced and undamped is a different model.
+    const float ForcingRate = SimForcingAmplitude * SimDragRate * Profile.z;
+
+    Omega += ForcingRate * SimDeltaTime * SimSampleSeed(ForcingUVW, SimForcingChannel);
 
 	// -- Vertical coupling --------------------------------------------------
 
@@ -757,6 +810,7 @@ void MainForceCS(uint3 Id : SV_DispatchThreadID)
 
 float SimFilterLatitude;
 int SimFilterMaxHalfWidth;
+
 
 /** Longitudinal box filter, widening toward the poles. See SimFilterHalfWidth
  *  for why this exists and what the rejected alternative was.

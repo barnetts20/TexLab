@@ -437,7 +437,7 @@ void FGasGiantSimulation::Enqueue_RenderThread(FRDGBuilder& GraphBuilder, const 
 		// residual view should be featureless on the very first frame. If it is
 		// not, the discretisation and the seeding disagree, which is a far more
 		// specific bug than "the sim looks wrong".
-		AddPoissonSolve(GraphBuilder, Params, R, FMath::Max(Params.PoissonIterations, 1));
+		AddPoissonSolve(GraphBuilder, Params, R, FMath::Max(Params.InitPoissonIterations, 1));
 
 		bInitialised = true;
 	}

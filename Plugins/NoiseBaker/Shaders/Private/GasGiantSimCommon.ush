@@ -369,55 +369,11 @@ float SimLaplacian(Texture2DArray<float> Field, int2 C, uint Layer, out float Ou
 		OutDiagonal);
 }
 
-/** Tangential velocity from the streamfunction, as a 3D vector in planet-local
- *  space, in ANGULAR units (radians per unit time on a unit sphere).
- *
- *  u = N x grad(psi), which on the sphere gives
- *
- *      u_east  = -cos(phi) dpsi/dmu
- *      u_north =  (1/cos(phi)) dpsi/dlambda
- *
- *  Returned as a 3D tangent vector rather than an (east, north) pair because
- *  that is what both consumers want: the advection backtrace needs a direction
- *  in the same space as the position, and the material's warp loop adds it to a
- *  unit vector. Reconstructing the tangent basis at the sample point in the
- *  material would cost a sincos it does not need to spend.
- *
- *  Centred differences, and the longitude one is taken through SimWrapCoord so
- *  it is correct at the seam. The mu difference is one-sided at the polar rows
- *  by way of the mirror, which is the correct thing there: the mirrored value
- *  is the field on the far side of the pole and the difference across it is
- *  real, not a boundary approximation.
- *
- *  Divided by cos(phi) for the north component, which is the one place a polar
- *  singularity is genuinely present in the velocity rather than removable. It
- *  is bounded on a cell-centred grid and further bounded by the zonal filter,
- *  which is what keeps that component from dominating the CFL at high
- *  latitude. */
-float3 SimVelocity(Texture2DArray<float> Psi, int2 C, uint Layer, out float OutPsi)
-{
-    const float DLon = (2.0f * PI) * SimInvGridSize.x;
-    const float DMu = 2.0f * SimInvGridSize.y;
-
-    const float Lon = SimColumnToLon((float) C.x);
-    const float Mu = SimRowToMu((float) C.y);
-    const float CosPhi = sqrt(1.0f - Mu * Mu);
-
-    OutPsi = SimLoad(Psi, C, Layer);
-
-    const float West = SimLoad(Psi, C + int2(-1, 0), Layer);
-    const float East = SimLoad(Psi, C + int2(1, 0), Layer);
-    const float South = SimLoad(Psi, C + int2(0, -1), Layer);
-    const float North = SimLoad(Psi, C + int2(0, 1), Layer);
-
-    const float DPsiDLon = (East - West) / (2.0f * DLon);
-    const float DPsiDMu = (North - South) / (2.0f * DMu);
-
-    const float UEast = -CosPhi * DPsiDMu;
-    const float UNorth = DPsiDLon / CosPhi;
-
-    return SimEast(Lon) * UEast + SimNorth(Lon, Mu) * UNorth;
-}
+// NOTE: the velocity helper that used to live here has been removed rather than
+// left unused. MainVelocityCS now differences the POLAR-MASKED streamfunction,
+// and a second entry point that differenced the raw one would be an easy
+// mistake to make and a hard one to see -- it would work everywhere except
+// within a few degrees of the poles.
 
 /** Half-width, in texels, of the longitudinal box filter at this latitude.
  *

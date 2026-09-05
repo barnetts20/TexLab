@@ -53,7 +53,7 @@ struct FGasGiantLayerProfile
 
 	/** Scales the stochastic forcing amplitude. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Layer")
-	float ForcingScale = 1.0f;
+	float ForcingScale = 7.0f;
 
 	/** Scales the eddy drag. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Layer")
@@ -79,6 +79,40 @@ class NOISEBAKER_API UGasGiantSimConfig : public UDataAsset
 	GENERATED_BODY()
 
 public:
+	// ------------------------------------------------------------------------
+	// THE DEFAULTS BELOW ARE DERIVED FROM ONE ANOTHER, NOT CHOSEN INDEPENDENTLY.
+	//
+	// Almost every failure during bring-up was a parameter that was individually
+	// reasonable and wrong in combination, so the relations are recorded here
+	// rather than left to be rediscovered. Changing the profile means rederiving
+	// the rest.
+	//
+	// With BandCount 5, JetStrength 0.18, EquatorialBoost 0.35:
+	//
+	//   peak rate               JetStrength * (1 + EquatorialBoost)   = 0.224
+	//   zonal vorticity scale   peak of |2 mu R - (1-mu^2) R'|        = 3.40
+	//   growth rate             JetStrength * BandCount * pi          = 2.83
+	//   eddy turnover           1 / growth                            = 0.354
+	//
+	// and then:
+	//
+	//   PlanetaryVorticity  >  65, the Rayleigh-Kuo requirement. 100 gives 1.5x.
+	//                          Scales linearly with JetStrength and QUADRATICALLY
+	//                          with BandCount, which is the easy one to miss.
+	//   NudgeRate           ~  8x growth, so the prescribed profile actually holds.
+	//   DragRate            ~  1x growth, arresting the cascade at the band scale.
+	//   ForcingAmplitude    ~  30% of the zonal vorticity scale: visible weather
+	//                          with the bands still legible.
+	//   ForcingDrift        ~  one feature per turnover, so forcing is stochastic
+	//                          rather than frozen.
+	//   StepRatio              1/240. TimeScale * StepRatio stays under the
+	//                          Courant limit of 0.0181 up to TimeScale ~4.3;
+	//                          past that the sim goes diffusive, and says so.
+	//   SeedScale              base feature = one band width (2/BandCount rad).
+	//   ForcingScale           feature well below the Rhines wavelength of 0.297,
+	//                          so the inverse cascade has room to organise it.
+	// ------------------------------------------------------------------------
+
 	// -- Grid ---------------------------------------------------------------
 
 	/** Longitude columns. MUST BE EVEN: the polar fold in SimWrapCoord offsets
@@ -109,15 +143,15 @@ public:
 	// maintained at. Divergence here means bands that do not sit on their jets.
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jet Profile", meta = (ClampMin = "1.0"))
-	float BandCount = 9.0f;
+	float BandCount = 5.0f;
 
 	/** Peak angular rate, radians per unit time on a unit sphere. Everything
 	 *  in the sim is scaled against this. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jet Profile")
-	float JetStrength = 0.1f;
+	float JetStrength = 0.18f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jet Profile")
-	float EquatorialBoost = 0.4f;
+	float EquatorialBoost = 0.35f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jet Profile")
 	float Asymmetry = 0.15f;
@@ -152,27 +186,46 @@ public:
 	 *  The quadratic in BandCount is why this is easy to get wrong -- adding
 	 *  two bands raises the requirement by half again. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Physics")
-	float PlanetaryVorticity = 80.0f;
+	float PlanetaryVorticity = 100.0f;
 
-	/** Simulated time per substep. Not a frame time.
+	/** Simulated time per second of real time. THE SPEED CONTROL, AND ONLY THAT.
 	 *
-	 *  The Courant limit is roughly GridLongitude * SimStepSize * JetStrength
-	 *  over 2 pi; keep that under about a third. Semi-Lagrangian will not go
-	 *  unstable above it, it will go DIFFUSIVE, which arrives at a bland field
-	 *  quickly and looks like weak forcing rather than a step problem. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Physics", meta = (ClampMin = "0.0001"))
-	float SimStepSize = 0.02f;
-
-	/** Simulated time per second of real time. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Physics")
+	 *  Changing it changes how fast simulated time passes and nothing else. The
+	 *  substep count per frame is unaffected, because the step size scales with
+	 *  it -- see StepRatio. Zero freezes the sim without tearing it down. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Physics", meta = (ClampMin = "0.0"))
 	float TimeScale = 1.0f;
+
+	/** Step size as a FRACTION OF TIMESCALE. Step = TimeScale * StepRatio.
+	 *
+	 *  Strictly proportional, with no upper clamp, and the absence of the clamp
+	 *  is the whole point.
+	 *
+	 *  Substeps per frame work out to DeltaTime / StepRatio, which contains no
+	 *  TimeScale at all, so the count is identical at every speed and slow
+	 *  motion stays smooth instead of degrading into single-stepping. An
+	 *  absolute step size cannot do that: simulated time per frame falls with
+	 *  TimeScale while the step stays fixed, so the count collapses to one and
+	 *  then to alternating zero-and-one.
+	 *
+	 *  A COURANT CLAMP ON TOP OF THIS WOULD BE WORSE THAN NO CLAMP. Below the
+	 *  clamp the step is proportional; above it the step is constant. So the
+	 *  relationship changes character at a threshold nothing in the UI shows,
+	 *  and the sim's numerical diffusion changes with it -- which reads as the
+	 *  physics responding to the speed control. The limit is REPORTED instead,
+	 *  once, on start.
+	 *
+	 *  1/240 gives four substeps per frame at 60fps, at any TimeScale. Halve it
+	 *  for smoother motion at double the cost. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Physics", meta = (ClampMin = "0.00001", ClampMax = "0.1"))
+	float StepRatio = 0.0041667f;
 
 	/** Cap on substeps per frame, so a hitch does not cascade into a longer
 	 *  hitch. Accumulated time beyond this is DISCARDED rather than carried,
 	 *  because carrying it means a stall is followed by a burst of steps that
 	 *  makes the next frame worse. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Physics", meta = (ClampMin = "1", ClampMax = "32"))
-	int32 MaxSubstepsPerFrame = 4;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Physics", meta = (ClampMin = "1", ClampMax = "64"))
+	int32 MaxSubstepsPerFrame = 8;
 
 	// -- Forcing ------------------------------------------------------------
 
@@ -184,7 +237,7 @@ public:
 	 *  is what lets advection and the Poisson solve be validated separately
 	 *  against known answers. Walk it down afterwards. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Forcing")
-	float NudgeRate = 2.0f;
+	float NudgeRate = 23.0f;
 
 	/** EQUILIBRIUM eddy vorticity sustained by the stochastic forcing.
 	 *
@@ -202,10 +255,10 @@ public:
 	 *  JetStrength 0.15. A third of that is visible weather that leaves the
 	 *  bands legible; approaching it starts to break them up. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Forcing")
-	float ForcingAmplitude = 0.4f;
+	float ForcingAmplitude = 1.0f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Forcing")
-	float ForcingScale = 8.0f;
+	float ForcingScale = 7.0f;
 
 	/** Drift through the forcing volume, in UVW per unit time. What
 	 *  decorrelates the forcing so it is stochastic rather than static.
@@ -224,7 +277,7 @@ public:
 	 *  Components are mutually incommensurate so the path through the tiling
 	 *  volume does not close and repeat. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Forcing")
-	FVector ForcingDrift = FVector(0.97, 0.61, 0.79);
+	FVector ForcingDrift = FVector(1.41, 0.89, 1.13);
 
 	/** Linear drag on the eddy vorticity, per unit time.
 	 *
@@ -241,7 +294,7 @@ public:
 	 *
 	 *  Same order as the growth rate is the right starting point. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Forcing")
-	float DragRate = 0.5f;
+	float DragRate = 3.1f;
 
 	/** Relaxation between vertically adjacent layers. Weak on purpose: strong
 	 *  coupling is the Taylor-Proudman limit, in which the stack collapses to
@@ -260,6 +313,7 @@ public:
 	 *  a loop over the whole grid. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Polar Filter", meta = (ClampMin = "1", ClampMax = "256"))
 	int32 FilterMaxHalfWidth = 48;
+
 
 	// -- Solver -------------------------------------------------------------
 
@@ -360,7 +414,7 @@ public:
 	 *  already larger than the flow can support and spin-up is spent taking it
 	 *  apart rather than organising it. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Seed")
-	float SeedScale = 4.0f;
+	float SeedScale = 2.5f;
 
 	// -- Spin-up ------------------------------------------------------------
 
@@ -439,27 +493,28 @@ struct FGasGiantSimParams
 	FVector4f BandShape = FVector4f(0.6f, 0.05f, 1.0f, 0.0f);
 	FVector4f LayerProfile[8];
 
-	float DeltaTime = 0.02f;
+	float DeltaTime = 0.0041667f;
 	float Time = 0.0f;
-	float PlanetaryVorticity = 80.0f;
+	float PlanetaryVorticity = 100.0f;
 
 	int32 SeedChannel = 0;
 	int32 ForcingChannel = 1;
 	bool bSeedBipolar = true;
 	float EddyAmplitude = 0.25f;
-	float SeedScale = 4.0f;
+	float SeedScale = 2.5f;
 
-	float NudgeRate = 2.0f;
-	float ForcingAmplitude = 0.4f;
-	float ForcingScale = 8.0f;
-	FVector3f ForcingDrift = FVector3f(0.97f, 0.61f, 0.79f);
-	float DragRate = 0.5f;
+	float NudgeRate = 23.0f;
+	float ForcingAmplitude = 1.0f;
+	float ForcingScale = 7.0f;
+	FVector3f ForcingDrift = FVector3f(1.41f, 0.89f, 1.13f);
+	float DragRate = 3.1f;
 	float LayerCoupling = 0.02f;
 
 	float FilterLatitude = 0.35f;
 	int32 FilterMaxHalfWidth = 48;
 
 	int32 PoissonIterations = 8;
+	int32 InitPoissonIterations = 256;
 	float Relaxation = 1.98f;
 
 	int32 DebugMode = 0;

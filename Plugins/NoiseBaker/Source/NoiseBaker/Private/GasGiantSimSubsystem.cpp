@@ -229,7 +229,47 @@ void UGasGiantSimSubsystem::StartSimulation(UGasGiantSimConfig* InConfig)
 	SpinUpTarget = FMath::Max(InConfig->SpinUpSteps, 0);
 	PendingManualSteps = 0;
 
+	ReportCourant();
+
 	ResetSimulation();
+}
+
+void UGasGiantSimSubsystem::ReportCourant() const
+{
+	if (!Config)
+	{
+		return;
+	}
+
+	// Reported, never enforced. Semi-Lagrangian does not go UNSTABLE past the
+	// Courant limit, it goes DIFFUSIVE -- arriving at a bland field quickly and
+	// presenting as weak forcing rather than as a timestep problem. Nothing in
+	// the output points back at the cause, so it is worth naming up front.
+	const float Step = Config->TimeScale * Config->StepRatio;
+	const float PeakRate = Config->JetStrength * (1.0f + Config->EquatorialBoost);
+	const int32 W = FMath::Max(Config->GridLongitude & ~1, 32);
+
+	const float Courant = PeakRate * Step * W / (2.0f * UE_PI);
+
+	const float MaxTimeScale = (Config->StepRatio > 0.0f && PeakRate > 0.0f)
+		? (0.33f * 2.0f * UE_PI) / (PeakRate * W * Config->StepRatio)
+		: 0.0f;
+
+	if (Courant > 0.33f)
+	{
+		UE_LOG(LogGasGiant, Warning,
+			TEXT("Courant %.2f exceeds 0.33 (step %.5f). The sim will go diffusive ")
+			TEXT("rather than unstable, so expect weak eddies and a bland field. ")
+			TEXT("Lower TimeScale below %.2f, or lower StepRatio."),
+			Courant, Step, MaxTimeScale);
+	}
+	else
+	{
+		UE_LOG(LogGasGiant, Log,
+			TEXT("Step %.5f, Courant %.3f, %.1f substeps/frame at 60fps. ")
+			TEXT("Diffusive above TimeScale %.2f."),
+			Step, Courant, (1.0f / 60.0f) / FMath::Max(Config->StepRatio, 1e-6f), MaxTimeScale);
+	}
 }
 
 void UGasGiantSimSubsystem::StopSimulation()
@@ -379,7 +419,11 @@ bool UGasGiantSimSubsystem::BuildParams(FGasGiantSimParams& Out) const
 		Out.LayerProfile[i] = FVector4f(P.JetScale, P.BoostScale, P.ForcingScale, P.DragScale);
 	}
 
-	Out.DeltaTime = FMath::Max(Config->SimStepSize, 1e-4f);
+	// Step = TimeScale * StepRatio. Strictly proportional and deliberately
+	// unclamped: a Courant cap here would make the step proportional below the
+	// cap and constant above it, so the sim's numerical character would change
+	// at a threshold the speed control gives no sign of. Reported instead.
+	Out.DeltaTime = FMath::Max(Config->TimeScale * Config->StepRatio, 0.0f);
 	Out.Time = SimulatedTime;
 	Out.PlanetaryVorticity = Config->PlanetaryVorticity;
 
@@ -400,6 +444,7 @@ bool UGasGiantSimSubsystem::BuildParams(FGasGiantSimParams& Out) const
 	Out.FilterMaxHalfWidth = FMath::Clamp(Config->FilterMaxHalfWidth, 1, 256);
 
 	Out.PoissonIterations = FMath::Clamp(Config->PoissonIterations, 1, 128);
+	Out.InitPoissonIterations = FMath::Clamp(Config->InitPoissonIterations, 1, 4096);
 
 	// Optimal over-relaxation, derived from the grid rather than authored.
 	//
@@ -526,7 +571,11 @@ void UGasGiantSimSubsystem::Tick(float DeltaTime)
 
 	int32 Substeps = 0;
 
-	const float StepSize = FMath::Max(Config->SimStepSize, 1e-4f);
+	// Derived exactly as BuildParams derives it, so the accumulator and the
+	// shader agree about how much time a substep is worth. Computed here rather
+	// than read back from Params because the substep COUNT has to be known
+	// before the params are built.
+	const float StepSize = FMath::Max(Config->TimeScale * Config->StepRatio, 0.0f);
 
 	if (StepsCompleted < SpinUpTarget)
 	{
@@ -547,7 +596,7 @@ void UGasGiantSimSubsystem::Tick(float DeltaTime)
 		Substeps = FMath::Min(PendingManualSteps, FMath::Max(Config->MaxSubstepsPerFrame, 1));
 		PendingManualSteps -= Substeps;
 	}
-	else if (!bPaused)
+	else if (!bPaused && StepSize > 0.0f)
 	{
 		StepAccumulator += DeltaTime * Config->TimeScale;
 

@@ -108,6 +108,10 @@ private:
 	 *  reliably ready to resolve a soft object reference that early. */
 	void TryAutoStart();
 
+	/** Logs the step size, Courant number and the TimeScale above which the sim
+	 *  goes diffusive. Reported, never enforced -- see StepRatio. */
+	void ReportCourant() const;
+
 	bool bTriedAutoStart = false;
 
 	/** Real time banked toward the next fixed substep. */
