@@ -28,63 +28,66 @@
  *  Names must match the declarations in GasGiantSim.usf exactly. */
 BEGIN_SHADER_PARAMETER_STRUCT(FGasGiantSimParameters, )
 
-	// -- Grid ---------------------------------------------------------------
-	SHADER_PARAMETER(FIntVector, SimGridSize)
-	SHADER_PARAMETER(FVector3f, SimInvGridSize)
+// -- Grid ---------------------------------------------------------------
+SHADER_PARAMETER(FIntVector, SimGridSize)
+SHADER_PARAMETER(FVector3f, SimInvGridSize)
 
-	// -- Profile ------------------------------------------------------------
-	SHADER_PARAMETER(FVector4f, SimJetParams)
-	SHADER_PARAMETER(FVector4f, SimBandShape)
-	SHADER_PARAMETER_ARRAY(FVector4f, SimLayerProfile, [8])
+// -- Profile ------------------------------------------------------------
+SHADER_PARAMETER(FVector4f, SimJetParams)
+SHADER_PARAMETER(FVector4f, SimBandShape)
+SHADER_PARAMETER_ARRAY(FVector4f, SimLayerProfile, [8])
 
-	// -- Time and rotation --------------------------------------------------
-	SHADER_PARAMETER(float, SimDeltaTime)
-	SHADER_PARAMETER(float, SimTime)
-	SHADER_PARAMETER(float, SimPlanetaryVorticity)
+// -- Time and rotation --------------------------------------------------
+SHADER_PARAMETER(float, SimDeltaTime)
+SHADER_PARAMETER(float, SimTime)
+SHADER_PARAMETER(float, SimPlanetaryVorticity)
 
-	// -- Seed ---------------------------------------------------------------
-	SHADER_PARAMETER(int32, SimSeedChannel)
-	SHADER_PARAMETER(float, SimEddyAmplitude)
-	SHADER_PARAMETER(float, SimSeedScale)
+// -- Seed ---------------------------------------------------------------
+SHADER_PARAMETER(int32, SimSeedChannel)
+SHADER_PARAMETER(int32, SimHasSeed)
+SHADER_PARAMETER(int32, SimForcingChannel)
+SHADER_PARAMETER(int32, SimSeedBipolar)
+SHADER_PARAMETER(float, SimEddyAmplitude)
+SHADER_PARAMETER(float, SimSeedScale)
 
-	// -- Forcing ------------------------------------------------------------
-	SHADER_PARAMETER(float, SimNudgeRate)
-	SHADER_PARAMETER(float, SimForcingAmplitude)
-	SHADER_PARAMETER(float, SimForcingScale)
-	SHADER_PARAMETER(FVector3f, SimForcingDrift)
-	SHADER_PARAMETER(float, SimDragRate)
-	SHADER_PARAMETER(float, SimLayerCoupling)
+// -- Forcing ------------------------------------------------------------
+SHADER_PARAMETER(float, SimNudgeRate)
+SHADER_PARAMETER(float, SimForcingAmplitude)
+SHADER_PARAMETER(float, SimForcingScale)
+SHADER_PARAMETER(FVector3f, SimForcingDrift)
+SHADER_PARAMETER(float, SimDragRate)
+SHADER_PARAMETER(float, SimLayerCoupling)
 
-	// -- Polar filter -------------------------------------------------------
-	SHADER_PARAMETER(float, SimFilterLatitude)
-	SHADER_PARAMETER(int32, SimFilterMaxHalfWidth)
+// -- Polar filter -------------------------------------------------------
+SHADER_PARAMETER(float, SimFilterLatitude)
+SHADER_PARAMETER(int32, SimFilterMaxHalfWidth)
 
-	// -- Solver -------------------------------------------------------------
-	SHADER_PARAMETER(float, SimRelaxation)
-	SHADER_PARAMETER(int32, SimRedBlackParity)
+// -- Solver -------------------------------------------------------------
+SHADER_PARAMETER(float, SimRelaxation)
+SHADER_PARAMETER(int32, SimRedBlackParity)
 
-	// -- Debug --------------------------------------------------------------
-	SHADER_PARAMETER(int32, SimDebugMode)
-	SHADER_PARAMETER(int32, SimDebugLayer)
-	SHADER_PARAMETER(float, SimDebugScale)
-	SHADER_PARAMETER(FIntPoint, SimDebugSize)
+// -- Debug --------------------------------------------------------------
+SHADER_PARAMETER(int32, SimDebugMode)
+SHADER_PARAMETER(int32, SimDebugLayer)
+SHADER_PARAMETER(float, SimDebugScale)
+SHADER_PARAMETER(FIntPoint, SimDebugSize)
 
-	// -- Resources ----------------------------------------------------------
-	SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2DArray<float>, SimVorticitySRV)
-	SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2DArray<float>, SimPsiSRV)
-	SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2DArray<float4>, SimVelocitySRV)
-	SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<float>, SimRowMeanSRV)
-	SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<float>, SimGlobalMeanSRV)
+// -- Resources ----------------------------------------------------------
+SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2DArray<float>, SimVorticitySRV)
+SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2DArray<float>, SimPsiSRV)
+SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2DArray<float4>, SimVelocitySRV)
+SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<float>, SimRowMeanSRV)
+SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<float>, SimGlobalMeanSRV)
 
-	SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float>, SimVorticityUAV)
-	SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float>, SimPsiUAV)
-	SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float4>, SimVelocityUAV)
-	SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float>, SimRowMeanUAV)
-	SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float>, SimGlobalMeanUAV)
-	SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, SimDebugUAV)
+SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float>, SimVorticityUAV)
+SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float>, SimPsiUAV)
+SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float4>, SimVelocityUAV)
+SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float>, SimRowMeanUAV)
+SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float>, SimGlobalMeanUAV)
+SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, SimDebugUAV)
 
-	SHADER_PARAMETER_TEXTURE(Texture3D, SimSeedNoise)
-	SHADER_PARAMETER_SAMPLER(SamplerState, SimSeedNoiseSampler)
+SHADER_PARAMETER_TEXTURE(Texture3D, SimSeedNoise)
+SHADER_PARAMETER_SAMPLER(SamplerState, SimSeedNoiseSampler)
 
 END_SHADER_PARAMETER_STRUCT()
 

@@ -230,10 +230,32 @@ void SimCubicWeights(float F, out float W0, out float W1, out float W2, out floa
  *  positive; nothing advected here is. */
 float SimSampleCubic(Texture2DArray<float> Field, float2 Grid, uint Layer)
 {
-    const float2 Base = floor(Grid - 0.5f) + 0.5f;
+	// INDEX SPACE, NOT UV SPACE. Texel centres sit on INTEGERS here, because
+	// that is what SimDirectionToGrid produces: column i maps to exactly i.
+	//
+	// The half-integer form -- floor(G - 0.5) + 0.5 -- is the correct base for
+	// UV*Size coordinates, where centres sit at 0.5, 1.5, 2.5. Using it on
+	// index-space input samples at G - 0.5 instead of G, in BOTH axes, for
+	// every input value.
+	//
+	// That failure is worth naming because it does not look like an
+	// interpolation bug. A constant offset in the departure point is
+	// indistinguishable from a constant velocity added to the flow: the field
+	// drifts steadily in +longitude and +mu at half a texel per step regardless
+	// of what the fluid is doing. At 512x256 and a 0.02 step that is 0.31 rad
+	// per unit time zonally -- three times the jet speed -- and a poleward
+	// sweep that crosses the sphere in about ten time units.
+	//
+	// So it reads as "the sim has a mysterious current in it", and because the
+	// two axes drift by an equal number of TEXELS rather than an equal arc,
+	// it reads as a stronger current in latitude than in longitude.
+    const float2 Base = floor(Grid);
     const float2 F = Grid - Base;
 
-    const int2 C0 = (int2) floor(Base) - int2(1, 1);
+	// Catmull-Rom taps run from one before the containing texel to two after,
+	// and the weights below put full weight on tap 1 when F is zero. So tap 1
+	// must be floor(Grid), which makes the first tap floor(Grid) - 1.
+    const int2 C0 = (int2) Base - int2(1, 1);
 
     float WX0, WX1, WX2, WX3;
     SimCubicWeights(F.x, WX0, WX1, WX2, WX3);

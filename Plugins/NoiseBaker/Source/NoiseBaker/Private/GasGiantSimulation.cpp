@@ -73,6 +73,9 @@ namespace
 		P.SimPlanetaryVorticity = Params.PlanetaryVorticity;
 
 		P.SimSeedChannel = Params.SeedChannel;
+		P.SimHasSeed = Params.SeedTexture.IsValid() ? 1 : 0;
+		P.SimForcingChannel = Params.ForcingChannel;
+		P.SimSeedBipolar = Params.bSeedBipolar ? 1 : 0;
 		P.SimEddyAmplitude = Params.EddyAmplitude;
 		P.SimSeedScale = Params.SeedScale;
 

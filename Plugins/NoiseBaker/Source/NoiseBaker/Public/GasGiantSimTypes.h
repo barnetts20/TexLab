@@ -135,10 +135,24 @@ public:
 	 *  profile would still look correct while being maintained entirely by the
 	 *  nudge, so this failure is invisible until the nudge comes down.
 	 *
-	 *  Wants to be well above JetStrength. The ratio sets the Rhines scale and
-	 *  therefore how many bands emerge without being told to. */
+	 *  IT IS BANDCOUNT THAT SETS THE REQUIREMENT, NOT JETSTRENGTH ALONE.
+	 *
+	 *  The Rhines wavenumber sqrt(beta/U) is the finest banding a given
+	 *  rotation rate can hold against a given wind speed. The prescribed
+	 *  profile asks for BandCount*pi. Equating them:
+	 *
+	 *      PlanetaryVorticity >= JetStrength * (BandCount * pi)^2
+	 *
+	 *  which at BandCount 9 and JetStrength 0.1 is about 80. Set it below that
+	 *  and the profile is asking for more bands than the rotation can support:
+	 *  the inverse cascade pushes energy up to the scale beta does permit, the
+	 *  jets go barotropically unstable, meander, roll up and merge into one or
+	 *  two hemispheric vortices. Bands appear, hold for a while, then collapse.
+	 *
+	 *  The quadratic in BandCount is why this is easy to get wrong -- adding
+	 *  two bands raises the requirement by half again. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Physics")
-	float PlanetaryVorticity = 4.0f;
+	float PlanetaryVorticity = 80.0f;
 
 	/** Simulated time per substep. Not a frame time.
 	 *
@@ -172,23 +186,62 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Forcing")
 	float NudgeRate = 2.0f;
 
-	/** Stochastic small-scale forcing amplitude. The isotropic forcing the
-	 *  banding physics assumes. Zero for the first bring-up. */
+	/** EQUILIBRIUM eddy vorticity sustained by the stochastic forcing.
+	 *
+	 *  This is what stops a well-damped run going laminar. Drag arrests the
+	 *  inverse cascade, which is what keeps bands intact -- but drag with
+	 *  nothing opposing it removes all the eddies too, and the result is clean
+	 *  bands with no weather on them. A forced-dissipative balance is what
+	 *  gives structure that persists without growing.
+	 *
+	 *  Expressed as an equilibrium rather than a rate, so it does not move when
+	 *  DragRate is tuned. See MainForceCS.
+	 *
+	 *  Compare against the zonal vorticity scale, about
+	 *  JetStrength * 0.69 * BandCount * pi -- 1.3 at BandCount 4 and
+	 *  JetStrength 0.15. A third of that is visible weather that leaves the
+	 *  bands legible; approaching it starts to break them up. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Forcing")
-	float ForcingAmplitude = 0.0f;
+	float ForcingAmplitude = 0.4f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Forcing")
 	float ForcingScale = 8.0f;
 
-	/** Drift through the forcing volume, which is what decorrelates it in
-	 *  time. Zero makes the forcing static and the sim reaches a fixed point. */
+	/** Drift through the forcing volume, in UVW per unit time. What
+	 *  decorrelates the forcing so it is stochastic rather than static.
+	 *
+	 *  MUST BE COMPARED AGAINST THE EDDY TURNOVER TIME, not chosen small
+	 *  because it is a drift. One forcing feature is 1/BasePeriod in UVW, so
+	 *  the pattern refreshes every (1/BasePeriod)/|Drift| time units, and the
+	 *  turnover is roughly 1/(JetStrength*BandCount*pi) -- about 0.5.
+	 *
+	 *  A drift of 0.03 refreshes every 17 units, thirty times slower than the
+	 *  flow evolves, which is indistinguishable from frozen: the sim converges
+	 *  to a fixed point with every structure pinned to a fixed longitude, and
+	 *  reads as laminar no matter how strong the forcing is. Near 1.0 puts
+	 *  refresh and turnover on the same timescale.
+	 *
+	 *  Components are mutually incommensurate so the path through the tiling
+	 *  volume does not close and repeat. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Forcing")
-	FVector ForcingDrift = FVector(0.03, 0.017, 0.023);
+	FVector ForcingDrift = FVector(0.97, 0.61, 0.79);
 
-	/** Linear drag on the eddy vorticity. The large-scale sink that arrests
-	 *  the inverse cascade; without it energy accumulates at the domain scale. */
+	/** Linear drag on the eddy vorticity, per unit time.
+	 *
+	 *  THE ONLY LARGE-SCALE ENERGY SINK IN THE MODEL, and it has to be compared
+	 *  against the instability growth rate, which is roughly
+	 *  JetStrength * BandCount * pi. At BandCount 4 and JetStrength 0.15 that
+	 *  is 1.88 per unit time, so a DragRate of 0.05 -- a 20 unit timescale --
+	 *  is nearly forty times too slow to arrest anything.
+	 *
+	 *  The nudge cannot substitute for it. The nudge controls the ZONAL MEAN,
+	 *  and a field that is mostly a single large eddy can carry a perfectly
+	 *  correct zonal mean while looking nothing like bands. Eddy energy needs
+	 *  its own sink.
+	 *
+	 *  Same order as the growth rate is the right starting point. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Forcing")
-	float DragRate = 0.05f;
+	float DragRate = 0.5f;
 
 	/** Relaxation between vertically adjacent layers. Weak on purpose: strong
 	 *  coupling is the Taylor-Proudman limit, in which the stack collapses to
@@ -224,12 +277,32 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Solver", meta = (ClampMin = "1", ClampMax = "4096"))
 	int32 InitPoissonIterations = 256;
 
-	/** Over-relaxation. 1 is plain Gauss-Seidel; the optimum for a problem
-	 *  this size is near 1.8. AT OR ABOVE 2 THE ITERATION DIVERGES, and it does
-	 *  so immediately rather than gradually, so a psi view that goes to solid
-	 *  saturation on the first frame is almost always this. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Solver", meta = (ClampMin = "0.1", ClampMax = "1.99"))
-	float Relaxation = 1.8f;
+	/** Over-relaxation. LEAVE AT 0 TO DERIVE IT FROM THE GRID.
+	 *
+	 *  The optimum is not a constant, it is a function of resolution, and it
+	 *  approaches 2 as the grid grows:
+	 *
+	 *      w_opt = 2 / (1 + sqrt(1 - rho_jacobi^2))
+	 *
+	 *  which at 512x256 is about 1.981. A hand-picked 1.8 -- a reasonable rule
+	 *  of thumb for a small grid -- is catastrophically off here, and the
+	 *  sensitivity is not intuitive: the smoothest mode's error decays 0.7% per
+	 *  substep at 1.8 against 14% at 1.981, so it accumulates to roughly 148x
+	 *  the per-step injection instead of 9x.
+	 *
+	 *  That accumulated error is a large-scale streamfunction error, which is a
+	 *  large-scale spurious VELOCITY, which advects everything into the lowest
+	 *  wavenumber available. It presents as the field collapsing to a single
+	 *  hemispheric mode -- indistinguishable, by eye, from a physical inverse
+	 *  cascade that failed to arrest.
+	 *
+	 *  Derived rather than defaulted so it cannot go stale when the grid
+	 *  changes. Set a positive value only to override deliberately.
+	 *
+	 *  AT OR ABOVE 2 THE ITERATION DIVERGES, immediately rather than gradually,
+	 *  so a psi view that saturates on the first frame is almost always this. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Solver", meta = (ClampMin = "0.0", ClampMax = "1.99"))
+	float Relaxation = 0.0f;
 
 	// -- Seed ---------------------------------------------------------------
 
@@ -247,12 +320,40 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Seed")
 	TObjectPtr<UVolumeTexture> SeedVolume;
 
+	/** Channel holding the eddy STREAMFUNCTION, read once at init. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Seed", meta = (ClampMin = "0", ClampMax = "3"))
 	int32 SeedChannel = 0;
 
-	/** Amplitude of the seeded eddy streamfunction relative to the zonal one. */
+	/** Channel holding the small-scale stochastic FORCING, read every step.
+	 *
+	 *  Should be a different channel from SeedChannel, and baked differently:
+	 *  the seed is differentiated twice and wants coarse and smooth, the
+	 *  forcing is added straight to vorticity and wants fine. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Seed", meta = (ClampMin = "0", ClampMax = "3"))
+	int32 ForcingChannel = 1;
+
+	/** True when the volume's channels were baked with bBipolarOutput.
+	 *
+	 *  MUST MATCH THE RECIPE. A unipolar decode applied to a signed bake maps
+	 *  [-1,1] onto [-3,1], which as a streamfunction is a large spurious
+	 *  circulation and as forcing is a constant vorticity source. Both look
+	 *  like the sim misbehaving rather than like a format mismatch.
+	 *
+	 *  The seed volume SHOULD be bipolar RGBA16F, so this should normally be
+	 *  true; it defaults that way so the correct setup is the default one. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Seed")
-	float EddyAmplitude = 0.05f;
+	bool bSeedBipolar = true;
+
+	/** Seeded eddy SPEED as a fraction of jet speed. 1.0 is eddies at roughly
+	 *  jet strength; 0.25 is a clear perturbation with the jets still firmly in
+	 *  charge.
+	 *
+	 *  A velocity ratio rather than a streamfunction amplitude, because
+	 *  velocity is the curl of psi and so scales as k*psi -- meaning a raw psi
+	 *  amplitude couples eddy STRENGTH to eddy SIZE through SeedScale, and
+	 *  tuning either detunes the other. See MainInitPotentialCS. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Seed")
+	float EddyAmplitude = 0.25f;
 
 	/** Domain scale of the seed lookup, which sets the SIZE of the seeded
 	 *  eddies. Should sit below the Rhines scale the jets imply, or the seed is
@@ -340,24 +441,26 @@ struct FGasGiantSimParams
 
 	float DeltaTime = 0.02f;
 	float Time = 0.0f;
-	float PlanetaryVorticity = 4.0f;
+	float PlanetaryVorticity = 80.0f;
 
 	int32 SeedChannel = 0;
-	float EddyAmplitude = 0.05f;
+	int32 ForcingChannel = 1;
+	bool bSeedBipolar = true;
+	float EddyAmplitude = 0.25f;
 	float SeedScale = 4.0f;
 
 	float NudgeRate = 2.0f;
-	float ForcingAmplitude = 0.0f;
+	float ForcingAmplitude = 0.4f;
 	float ForcingScale = 8.0f;
-	FVector3f ForcingDrift = FVector3f(0.03f, 0.017f, 0.023f);
-	float DragRate = 0.05f;
+	FVector3f ForcingDrift = FVector3f(0.97f, 0.61f, 0.79f);
+	float DragRate = 0.5f;
 	float LayerCoupling = 0.02f;
 
 	float FilterLatitude = 0.35f;
 	int32 FilterMaxHalfWidth = 48;
 
 	int32 PoissonIterations = 8;
-	float Relaxation = 1.8f;
+	float Relaxation = 1.98f;
 
 	int32 DebugMode = 0;
 	int32 DebugLayer = 0;

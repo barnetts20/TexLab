@@ -384,6 +384,8 @@ bool UGasGiantSimSubsystem::BuildParams(FGasGiantSimParams& Out) const
 	Out.PlanetaryVorticity = Config->PlanetaryVorticity;
 
 	Out.SeedChannel = FMath::Clamp(Config->SeedChannel, 0, 3);
+	Out.ForcingChannel = FMath::Clamp(Config->ForcingChannel, 0, 3);
+	Out.bSeedBipolar = Config->bSeedBipolar;
 	Out.EddyAmplitude = Config->EddyAmplitude;
 	Out.SeedScale = Config->SeedScale;
 
@@ -399,10 +401,32 @@ bool UGasGiantSimSubsystem::BuildParams(FGasGiantSimParams& Out) const
 
 	Out.PoissonIterations = FMath::Clamp(Config->PoissonIterations, 1, 128);
 
-	// Hard clamp below 2. At or above it the SOR iteration diverges
-	// immediately, and the symptom -- psi saturating on the first frame -- is
-	// far enough from the cause to be worth making unreachable.
-	Out.Relaxation = FMath::Clamp(Config->Relaxation, 0.1f, 1.99f);
+	// Optimal over-relaxation, derived from the grid rather than authored.
+	//
+	//   rho_jacobi = (cos(pi/N) + cos(pi/M)) / 2
+	//   w_opt      = 2 / (1 + sqrt(1 - rho^2))
+	//
+	// which tends to 2 as the grid grows -- 1.981 at 512x256. Derived because
+	// the value is resolution dependent and a hardcoded one silently detunes
+	// the solver the moment somebody changes the grid, in a way that looks like
+	// a physics failure rather than a solver setting.
+	if (Config->Relaxation <= 0.0f)
+	{
+		const double RhoJacobi = 0.5 * (
+			FMath::Cos(UE_DOUBLE_PI / (double)W) +
+			FMath::Cos(UE_DOUBLE_PI / (double)H));
+
+		const double Wopt = 2.0 / (1.0 + FMath::Sqrt(FMath::Max(1.0 - RhoJacobi * RhoJacobi, 0.0)));
+
+		Out.Relaxation = (float)FMath::Clamp(Wopt, 0.1, 1.99);
+	}
+	else
+	{
+		// Hard clamp below 2. At or above it the SOR iteration diverges
+		// immediately, and the symptom -- psi saturating on the first frame --
+		// is far enough from the cause to be worth making unreachable.
+		Out.Relaxation = FMath::Clamp(Config->Relaxation, 0.1f, 1.99f);
+	}
 
 	const int32 ModeOverride = CVarGasGiantDebugMode.GetValueOnGameThread();
 	const int32 LayerOverride = CVarGasGiantDebugLayer.GetValueOnGameThread();
