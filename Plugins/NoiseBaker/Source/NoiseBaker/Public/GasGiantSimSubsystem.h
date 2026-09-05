@@ -6,6 +6,7 @@
 #include "GasGiantSimSubsystem.generated.h"
 
 class FGasGiantSimulation;
+class UGasGiantSnapshot;
 
 /** Game-thread driver for the flow sim.
  *
@@ -64,9 +65,17 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Gas Giant")
 	void StopSimulation();
 
-	/** Discard the field and re-seed from the current config. */
+	/** Discard the field and re-seed, or re-upload InitialState if one is set. */
 	UFUNCTION(BlueprintCallable, Category = "Gas Giant")
 	void ResetSimulation();
+
+	/** Capture the live state into a snapshot asset.
+	 *
+	 *  BLOCKS on the GPU. An authoring operation, not a runtime one -- it
+	 *  flushes rendering, waits for the readback and copies a few megabytes
+	 *  back. Calling it per frame would stall the pipeline every frame. */
+	UFUNCTION(BlueprintCallable, Category = "Gas Giant")
+	bool SaveSnapshot(UGasGiantSnapshot* Target);
 
 	/** Advance exactly N substeps and then pause. The single most useful thing
 	 *  in here while bringing the solver up: watching one advection step at a
@@ -83,6 +92,14 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "Gas Giant")
 	int32 GetStepsCompleted() const { return StepsCompleted; }
+
+	/** Current Courant number: peak rate * step * GridLongitude / 2pi.
+	 *
+	 *  A consequence of StepRatio, the profile and the grid, not a control.
+	 *  Above 0.33 the numerical diffusion becomes a real dissipation term, so
+	 *  this is worth watching when tuning DragRate. */
+	UFUNCTION(BlueprintCallable, Category = "Gas Giant")
+	float GetCourant() const;
 
 private:
 	/** Builds the flat render-thread snapshot. Returns false if the config is
@@ -103,10 +120,23 @@ private:
 
 	FGasGiantSimulation* Simulation = nullptr;
 
+	/** Hands the render thread the InitialState payload, if there is one worth
+	 *  handing over. Returns true when a restore was queued, so the caller can
+	 *  skip spin-up. */
+	bool QueueInitialState();
+
 	/** Consults UGasGiantSimSettings and starts if this world type wants it.
 	 *  Run from the first Tick rather than Initialize, because the world is not
 	 *  reliably ready to resolve a soft object reference that early. */
 	void TryAutoStart();
+
+	/** Logs any setting that is authored but currently has no effect.
+	 *
+	 *  An inert parameter is the failure mode this system produces most often
+	 *  and hides best: nothing errors, the value sits in the details panel
+	 *  looking applied, and the only symptom is that changing it does nothing.
+	 *  Cheaper to state at start than to rediscover. */
+	void ReportInertSettings() const;
 
 	/** Logs the step size, Courant number and the TimeScale above which the sim
 	 *  goes diffusive. Reported, never enforced -- see StepRatio. */

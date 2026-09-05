@@ -2,6 +2,9 @@
 
 #include "GasGiantSimulation.h"
 #include "GasGiantSimSettings.h"
+#include "GasGiantSnapshot.h"
+#include "RHIGPUReadback.h"
+#include "RenderGraphBuilder.h"
 #include "Engine/VolumeTexture.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "Engine/TextureRenderTarget2DArray.h"
@@ -151,6 +154,39 @@ static FAutoConsoleCommandWithWorldAndArgs GGasGiantStepCmd(
 			}
 		}));
 
+static FAutoConsoleCommandWithWorldAndArgs GGasGiantSaveCmd(
+	TEXT("GasGiant.Save"),
+	TEXT("Capture the live state into a GasGiantSnapshot asset. Argument is the ")
+	TEXT("asset path. Blocks on the GPU; an authoring operation."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+		[](const TArray<FString>& Args, UWorld* World)
+		{
+			if (Args.Num() == 0)
+			{
+				UE_LOG(LogGasGiant, Error, TEXT("GasGiant.Save needs a snapshot asset path."));
+				return;
+			}
+
+			UGasGiantSimSubsystem* Sub = FindSubsystem(World);
+
+			if (!Sub)
+			{
+				return;
+			}
+
+			UGasGiantSnapshot* Target = LoadObject<UGasGiantSnapshot>(nullptr, *Args[0]);
+
+			if (!Target)
+			{
+				UE_LOG(LogGasGiant, Error,
+					TEXT("No GasGiantSnapshot at '%s'. Create the asset first, then save into it."),
+					*Args[0]);
+				return;
+			}
+
+			Sub->SaveSnapshot(Target);
+		}));
+
 static FAutoConsoleCommandWithWorldAndArgs GGasGiantStatusCmd(
 	TEXT("GasGiant.Status"),
 	TEXT("Report step count, simulated time and spin-up progress."),
@@ -160,14 +196,25 @@ static FAutoConsoleCommandWithWorldAndArgs GGasGiantStatusCmd(
 			if (UGasGiantSimSubsystem* Sub = FindSubsystem(World))
 			{
 				UE_LOG(LogGasGiant, Display,
-					TEXT("steps %d, simulated time %.2f, %s"),
+					TEXT("steps %d, simulated time %.2f, Courant %.3f, %s"),
 					Sub->GetStepsCompleted(),
 					Sub->GetSimulatedTime(),
+					Sub->GetCourant(),
 					Sub->IsSpinningUp() ? TEXT("spinning up") : TEXT("free running"));
 			}
 		}));
 
 // ---------------------------------------------------------------------------
+
+/** Peak angular rate the profile can reach.
+ *
+ *  The saturation caps the shaped term at 1, and the equatorial boost is added
+ *  AFTER it and so is not bounded by it. Conservative when the profile does not
+ *  fully saturate, exact when it does -- which it does at the defaults. */
+static float GasGiantPeakRate(const UGasGiantSimConfig& Config)
+{
+	return FMath::Max(Config.JetStrength * (1.0f + Config.EquatorialBoost), 1e-6f);
+}
 
 void UGasGiantSimSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
@@ -226,12 +273,122 @@ void UGasGiantSimSubsystem::StartSimulation(UGasGiantSimConfig* InConfig)
 	StepAccumulator = 0.0f;
 	SimulatedTime = 0.0f;
 	StepsCompleted = 0;
-	SpinUpTarget = FMath::Max(InConfig->SpinUpSteps, 0);
 	PendingManualSteps = 0;
 
 	ReportCourant();
+	ReportInertSettings();
 
+	// ResetSimulation owns the restore-or-seed decision, so starting and
+	// resetting cannot diverge. They did: reset used to only clear the field,
+	// which meant GasGiant.Reset reseeded even with a snapshot bound.
 	ResetSimulation();
+}
+
+float UGasGiantSimSubsystem::GetCourant() const
+{
+	if (!Config)
+	{
+		return 0.0f;
+	}
+
+	const int32 W = FMath::Max(Config->GridLongitude & ~1, 32);
+	const float Step = Config->TimeScale * Config->StepRatio;
+
+	return GasGiantPeakRate(*Config) * Step * W / (2.0f * UE_PI);
+}
+
+void UGasGiantSimSubsystem::ReportInertSettings() const
+{
+	if (!Config)
+	{
+		return;
+	}
+
+	// Forcing with nowhere to sample from. SimSampleForcing returns exactly
+	// zero when no volume is bound, so the amplitude, scale and drift are all
+	// dormant -- and will all switch on together the moment a volume is
+	// assigned, which is a surprising amount of change from one assignment.
+	if (Config->ForcingAmplitude > 0.0f && !Config->ForcingVolume)
+	{
+		UE_LOG(LogGasGiant, Warning,
+			TEXT("ForcingAmplitude is %.3f but no ForcingVolume is bound, so the ")
+			TEXT("stochastic forcing is inactive. The nudge is the only energy ")
+			TEXT("source. Assigning a volume will switch amplitude, scale and ")
+			TEXT("drift on all at once."),
+			Config->ForcingAmplitude);
+	}
+
+	// Forcing that never refreshes. The pattern has to move by about one
+	// feature per eddy turnover to read as stochastic; far slower than that and
+	// the sim converges to a fixed point with every structure pinned to a fixed
+	// longitude, which looks laminar however strong the forcing is.
+	if (Config->ForcingAmplitude > 0.0f && Config->ForcingVolume)
+	{
+		const float Growth = Config->JetStrength * Config->BandCount * UE_PI;
+		const float DriftRate = (float)Config->ForcingDrift.Size();
+
+		if (Growth > 0.0f && DriftRate > 0.0f && DriftRate < Growth * 0.05f)
+		{
+			UE_LOG(LogGasGiant, Warning,
+				TEXT("ForcingDrift %.4f is far below the growth rate %.2f, so the ")
+				TEXT("forcing is effectively frozen and the field will settle to a ")
+				TEXT("fixed pattern. Near %.2f puts refresh on the turnover timescale."),
+				DriftRate, Growth, Growth);
+		}
+	}
+
+	// Vertical coupling with nothing to couple to.
+	if (Config->LayerCoupling > 0.0f && Config->LayerCount < 2)
+	{
+		UE_LOG(LogGasGiant, Warning,
+			TEXT("LayerCoupling is %.3f but LayerCount is 1, so it does nothing."),
+			Config->LayerCoupling);
+	}
+
+	// Spin-up that will never run, and the solve that goes with it.
+	if (Config->InitialState && Config->SpinUpSteps > 0)
+	{
+		UE_LOG(LogGasGiant, Log,
+			TEXT("InitialState is bound, so SpinUpSteps (%d) and ")
+			TEXT("InitPoissonIterations (%d) are skipped -- a restored state is ")
+			TEXT("already spun up and its psi arrives consistent with its ")
+			TEXT("vorticity. Both still matter when CREATING snapshots."),
+			Config->SpinUpSteps, Config->InitPoissonIterations);
+	}
+
+	// The polar filter switched off entirely. Legal, and at a high Courant
+	// number the numerical diffusion covers for it, but worth saying because
+	// FilterMaxHalfWidth then looks like it should be doing something.
+	if (Config->FilterLatitude <= 0.0f)
+	{
+		UE_LOG(LogGasGiant, Log,
+			TEXT("FilterLatitude is 0, so the polar filter is disabled entirely ")
+			TEXT("and FilterMaxHalfWidth has no effect."));
+	}
+	else if (Config->FilterLatitude > 0.5f)
+	{
+		const float Deg = FMath::RadiansToDegrees(FMath::Acos(Config->FilterLatitude));
+
+		UE_LOG(LogGasGiant, Log,
+			TEXT("FilterLatitude %.2f engages the longitudinal filter poleward of ")
+			TEXT("%.1f degrees, which is most of the visible disc rather than just ")
+			TEXT("the poles."),
+			Config->FilterLatitude, Deg);
+	}
+
+	// The nudge only has leverage in proportion to how supercritical the jets
+	// are. Above marginal there is no instability to maintain against, so
+	// NudgeRate stops mattering -- and that reads as a regression rather than
+	// as the supercriticality going away.
+	const float Growth = Config->JetStrength * Config->BandCount * UE_PI;
+
+	if (Growth > 0.0f && Config->NudgeRate > 0.0f && Config->NudgeRate < Growth * 0.01f)
+	{
+		UE_LOG(LogGasGiant, Log,
+			TEXT("NudgeRate %.3f is under 1%% of the growth rate %.2f, so the ")
+			TEXT("prescribed profile will not hold against the instability."),
+			Config->NudgeRate, Growth);
+	}
 }
 
 void UGasGiantSimSubsystem::ReportCourant() const
@@ -241,34 +398,34 @@ void UGasGiantSimSubsystem::ReportCourant() const
 		return;
 	}
 
-	// Reported, never enforced. Semi-Lagrangian does not go UNSTABLE past the
-	// Courant limit, it goes DIFFUSIVE -- arriving at a bland field quickly and
-	// presenting as weak forcing rather than as a timestep problem. Nothing in
-	// the output points back at the cause, so it is worth naming up front.
+	// A CONSEQUENCE, NOT A CONTROL.
+	//
+	// StepRatio is what is authored, because it pins the substep count and
+	// therefore the frame cost. Courant then falls out of it together with the
+	// peak rate and the grid width, so it moves whenever the profile is
+	// touched -- which is exactly why it is reported rather than authored.
+	//
+	// Semi-Lagrangian does not go UNSTABLE past 0.33, it goes DIFFUSIVE, and
+	// that diffusion is a real energy sink. When DragRate is small it can be
+	// most of the dissipation, which makes it a physics term wearing the
+	// clothes of an accuracy setting. Worth naming at start, because nothing in
+	// the output points back at the timestep.
 	const float Step = Config->TimeScale * Config->StepRatio;
-	const float PeakRate = Config->JetStrength * (1.0f + Config->EquatorialBoost);
-	const int32 W = FMath::Max(Config->GridLongitude & ~1, 32);
+	const float Courant = GetCourant();
 
-	const float Courant = PeakRate * Step * W / (2.0f * UE_PI);
-
-	const float MaxTimeScale = (Config->StepRatio > 0.0f && PeakRate > 0.0f)
-		? (0.33f * 2.0f * UE_PI) / (PeakRate * W * Config->StepRatio)
-		: 0.0f;
+	UE_LOG(LogGasGiant, Log,
+		TEXT("StepRatio %.5f -> step %.5f at TimeScale %.2f, Courant %.3f, ")
+		TEXT("%.1f substeps/frame at 60fps."),
+		Config->StepRatio, Step, Config->TimeScale, Courant,
+		(1.0f / 60.0f) / FMath::Max(Config->StepRatio, 1e-9f));
 
 	if (Courant > 0.33f)
 	{
-		UE_LOG(LogGasGiant, Warning,
-			TEXT("Courant %.2f exceeds 0.33 (step %.5f). The sim will go diffusive ")
-			TEXT("rather than unstable, so expect weak eddies and a bland field. ")
-			TEXT("Lower TimeScale below %.2f, or lower StepRatio."),
-			Courant, Step, MaxTimeScale);
-	}
-	else
-	{
 		UE_LOG(LogGasGiant, Log,
-			TEXT("Step %.5f, Courant %.3f, %.1f substeps/frame at 60fps. ")
-			TEXT("Diffusive above TimeScale %.2f."),
-			Step, Courant, (1.0f / 60.0f) / FMath::Max(Config->StepRatio, 1e-6f), MaxTimeScale);
+			TEXT("Courant is above 0.33, so numerical diffusion is a significant ")
+			TEXT("energy sink and the look is tied to this TimeScale -- Courant ")
+			TEXT("scales with it while DragRate does not. Intended at the defaults; ")
+			TEXT("raise DragRate and lower StepRatio to decouple."));
 	}
 }
 
@@ -283,16 +440,208 @@ void UGasGiantSimSubsystem::ResetSimulation()
 	StepsCompleted = 0;
 	StepAccumulator = 0.0f;
 
-	if (Simulation)
+	if (!Simulation)
 	{
-		FGasGiantSimulation* Sim = Simulation;
-
-		ENQUEUE_RENDER_COMMAND(GasGiantReset)(
-			[Sim](FRHICommandListImmediate&)
-			{
-				Sim->RequestReset();
-			});
+		return;
 	}
+
+	FGasGiantSimulation* Sim = Simulation;
+
+	ENQUEUE_RENDER_COMMAND(GasGiantReset)(
+		[Sim](FRHICommandListImmediate&)
+		{
+			Sim->RequestReset();
+		});
+
+	// Then hand back the start state, if there is one. Both are render
+	// commands and run in order, so the payload arrives after the reset flag
+	// and survives it.
+	//
+	// A restored state is already spun up by definition, so the spin-up budget
+	// is zero and simulated time continues from where it was captured -- which
+	// keeps the forcing drift continuous rather than snapping it back.
+	const bool bRestored = QueueInitialState();
+
+	SpinUpTarget = (bRestored || !Config) ? 0 : FMath::Max(Config->SpinUpSteps, 0);
+
+	if (bRestored)
+	{
+		SimulatedTime = Config->InitialState->SimulatedTime;
+		StepsCompleted = Config->InitialState->StepsCompleted;
+	}
+}
+
+bool UGasGiantSimSubsystem::QueueInitialState()
+{
+	if (!Config || !Config->InitialState || !Simulation)
+	{
+		return false;
+	}
+
+	UGasGiantSnapshot* Snapshot = Config->InitialState;
+
+	const FIntVector Grid(
+		FMath::Max(Config->GridLongitude & ~1, 32),
+		FMath::Max(Config->GridLatitude, 16),
+		FMath::Clamp(Config->LayerCount, 1, 8));
+
+	if (!Snapshot->IsValidFor(Grid))
+	{
+		UE_LOG(LogGasGiant, Warning,
+			TEXT("InitialState '%s' was captured at %dx%dx%d but the config is ")
+			TEXT("%dx%dx%d. Seeding instead -- a vorticity field cannot be ")
+			TEXT("resampled onto a different grid any more cheaply than it can ")
+			TEXT("be re-spun."),
+			*Snapshot->GetName(),
+			Snapshot->Grid.X, Snapshot->Grid.Y, Snapshot->Grid.Z,
+			Grid.X, Grid.Y, Grid.Z);
+
+		return false;
+	}
+
+	// Shape mismatch is a WARNING, not a refusal. The nudge will re-register
+	// the zonal mean over a few hundred steps, so the state is usable -- it
+	// just is not the state that was captured, and it drifts toward the new
+	// profile while looking like neither. Worth saying out loud, because
+	// nothing about the result points back at the snapshot.
+	FGasGiantSnapshotProvenance Now;
+	Now.BandCount = Config->BandCount;
+	Now.JetStrength = Config->JetStrength;
+	Now.EquatorialBoost = Config->EquatorialBoost;
+	Now.Asymmetry = Config->Asymmetry;
+	Now.BandShape = Config->BandShape;
+	Now.PlanetaryVorticity = Config->PlanetaryVorticity;
+
+	if (!Snapshot->Provenance.MatchesShape(Now))
+	{
+		UE_LOG(LogGasGiant, Warning,
+			TEXT("InitialState '%s' was captured under a different jet profile. ")
+			TEXT("Its eddies sit on jets this config does not have; the nudge ")
+			TEXT("will re-register them over a few hundred steps."),
+			*Snapshot->GetName());
+	}
+
+	// One flat payload, vorticity then psi, matching the shader's layout.
+	TArray<float> Payload;
+	Payload.Reserve(Snapshot->Vorticity.Num() + Snapshot->Psi.Num());
+	Payload.Append(Snapshot->Vorticity);
+	Payload.Append(Snapshot->Psi);
+
+	FGasGiantSimulation* Sim = Simulation;
+
+	ENQUEUE_RENDER_COMMAND(GasGiantQueueRestore)(
+		[Sim, Payload = MoveTemp(Payload)](FRHICommandListImmediate&) mutable
+		{
+			Sim->QueueRestore_RenderThread(MoveTemp(Payload));
+		});
+
+	UE_LOG(LogGasGiant, Log, TEXT("Starting from snapshot '%s' at simulated time %.2f."),
+		*Snapshot->GetName(), Snapshot->SimulatedTime);
+
+	return true;
+}
+
+bool UGasGiantSimSubsystem::SaveSnapshot(UGasGiantSnapshot* Target)
+{
+	if (!Target || !Config || !Simulation)
+	{
+		UE_LOG(LogGasGiant, Error, TEXT("SaveSnapshot needs a target asset and a running sim."));
+		return false;
+	}
+
+	FGasGiantSimParams Params;
+	if (!BuildParams(Params))
+	{
+		return false;
+	}
+
+	const int32 Total = Params.GridSize.X * Params.GridSize.Y * Params.GridSize.Z;
+
+	FGasGiantSimulation* Sim = Simulation;
+
+	// THE READBACK MUST BE LOCKED ON THE RENDER THREAD.
+	//
+	// FRHIGPUBufferReadback::Lock goes through RHILockStagingBuffer, which is
+	// render-thread-only on every RHI. Calling it from the game thread after a
+	// flush looks reasonable -- the work is demonstrably finished by then --
+	// and crashes inside the RHI regardless, because the thread is what is
+	// being checked, not the state.
+	//
+	// So the whole capture, wait and copy happens inside one render command,
+	// and only the finished float array crosses back. Result and bSucceeded are
+	// captured by reference, which is safe precisely because the flush below
+	// blocks until the command has run.
+	TArray<float> Result;
+	bool bSucceeded = false;
+
+	ENQUEUE_RENDER_COMMAND(GasGiantCapture)(
+		[Sim, Params, Total, &Result, &bSucceeded](FRHICommandListImmediate& RHICmdList)
+		{
+			FRHIGPUBufferReadback Readback(TEXT("GasGiant.SnapshotReadback"));
+
+			{
+				FRDGBuilder GraphBuilder(RHICmdList);
+
+				Sim->AddCapturePass_RenderThread(GraphBuilder, Params, &Readback);
+
+				GraphBuilder.Execute();
+			}
+
+			// Submits the command list and waits. Heavy-handed, and correct for
+			// an authoring path: the alternative is polling a fence across
+			// frames, which means the asset write has to survive the world being
+			// torn down underneath it.
+			RHICmdList.BlockUntilGPUIdle();
+
+			if (!Readback.IsReady())
+			{
+				return;
+			}
+
+			const uint32 Bytes = (uint32)Total * 2u * sizeof(float);
+
+			if (const void* Data = Readback.Lock(Bytes))
+			{
+				Result.SetNumUninitialized(Total * 2);
+				FMemory::Memcpy(Result.GetData(), Data, Bytes);
+				bSucceeded = true;
+			}
+
+			Readback.Unlock();
+		});
+
+	FlushRenderingCommands();
+
+	if (!bSucceeded || Result.Num() != Total * 2)
+	{
+		UE_LOG(LogGasGiant, Error,
+			TEXT("Snapshot readback failed. Is the sim initialised and running?"));
+		return false;
+	}
+
+	Target->Grid = Params.GridSize;
+	Target->Vorticity.SetNumUninitialized(Total);
+	Target->Psi.SetNumUninitialized(Total);
+	FMemory::Memcpy(Target->Vorticity.GetData(), Result.GetData(), Total * sizeof(float));
+	FMemory::Memcpy(Target->Psi.GetData(), Result.GetData() + Total, Total * sizeof(float));
+
+	Target->Provenance.BandCount = Config->BandCount;
+	Target->Provenance.JetStrength = Config->JetStrength;
+	Target->Provenance.EquatorialBoost = Config->EquatorialBoost;
+	Target->Provenance.Asymmetry = Config->Asymmetry;
+	Target->Provenance.BandShape = Config->BandShape;
+	Target->Provenance.PlanetaryVorticity = Config->PlanetaryVorticity;
+	Target->SimulatedTime = SimulatedTime;
+	Target->StepsCompleted = StepsCompleted;
+
+	Target->MarkPackageDirty();
+
+	UE_LOG(LogGasGiant, Display,
+		TEXT("Saved snapshot '%s': %dx%dx%d, %d steps, simulated time %.2f."),
+		*Target->GetName(), Target->Grid.X, Target->Grid.Y, Target->Grid.Z,
+		StepsCompleted, SimulatedTime);
+
+	return true;
 }
 
 void UGasGiantSimSubsystem::StepOnce(int32 NumSteps)
@@ -421,17 +770,15 @@ bool UGasGiantSimSubsystem::BuildParams(FGasGiantSimParams& Out) const
 
 	// Step = TimeScale * StepRatio. Strictly proportional and deliberately
 	// unclamped: a Courant cap here would make the step proportional below the
-	// cap and constant above it, so the sim's numerical character would change
-	// at a threshold the speed control gives no sign of. Reported instead.
+	// cap and constant above it, so the numerical character would change at a
+	// threshold the speed control gives no sign of. Courant is reported at
+	// start and available from GetCourant() instead.
 	Out.DeltaTime = FMath::Max(Config->TimeScale * Config->StepRatio, 0.0f);
 	Out.Time = SimulatedTime;
 	Out.PlanetaryVorticity = Config->PlanetaryVorticity;
 
-	Out.SeedChannel = FMath::Clamp(Config->SeedChannel, 0, 3);
 	Out.ForcingChannel = FMath::Clamp(Config->ForcingChannel, 0, 3);
-	Out.bSeedBipolar = Config->bSeedBipolar;
-	Out.EddyAmplitude = Config->EddyAmplitude;
-	Out.SeedScale = Config->SeedScale;
+	Out.bForcingBipolar = Config->bForcingBipolar;
 
 	Out.NudgeRate = Config->NudgeRate;
 	Out.ForcingAmplitude = Config->ForcingAmplitude;
@@ -479,13 +826,52 @@ bool UGasGiantSimSubsystem::BuildParams(FGasGiantSimParams& Out) const
 
 	Out.DebugMode = (ModeOverride >= 0) ? ModeOverride : (int32)Config->DebugMode;
 	Out.DebugLayer = FMath::Clamp((LayerOverride >= 0) ? LayerOverride : Config->DebugLayer, 0, Slices - 1);
-	Out.DebugScale = (ScaleOverride > 0.0f) ? ScaleOverride : Config->DebugScale;
+	// DEBUG SCALE DERIVED PER MODE when left at zero, because the seven fields
+	// differ in magnitude by two orders. Vorticity is O(3), streamfunction
+	// O(0.01), the residual near zero -- so one authored number is right for
+	// one of them and renders a genuine residual failure as solid black.
+	//
+	// From the profile rather than a running maximum: a max that chases the
+	// field hides a drifting magnitude, which is one of the things the view
+	// exists to reveal.
+	if (ScaleOverride > 0.0f)
+	{
+		Out.DebugScale = ScaleOverride;
+	}
+	else if (Config->DebugScale > 0.0f)
+	{
+		Out.DebugScale = Config->DebugScale;
+	}
+	else
+	{
+		const float PeakRate = GasGiantPeakRate(*Config);
+		const float ZetaScale = Config->JetStrength * 0.6897f * Config->BandCount * UE_PI;
+		const float PsiScale = PeakRate / FMath::Max(Config->BandCount * UE_PI, 1.0f);
+
+		switch (Config->DebugMode)
+		{
+		case EGasGiantDebugMode::Vorticity:   Out.DebugScale = ZetaScale + Config->ForcingAmplitude; break;
+		case EGasGiantDebugMode::Psi:         Out.DebugScale = PsiScale * 2.0f; break;
+		case EGasGiantDebugMode::Speed:
+		case EGasGiantDebugMode::East:        Out.DebugScale = PeakRate; break;
+			// Meridional flow is eddy only, with no zonal contribution at all, so
+			// it is far smaller than the eastward component.
+		case EGasGiantDebugMode::North:       Out.DebugScale = PeakRate * 0.15f; break;
+			// Should be near zero. Scaled hard so a residual that is merely small
+			// still reads, rather than rounding to black alongside a converged one.
+		case EGasGiantDebugMode::Residual:    Out.DebugScale = ZetaScale * 0.01f; break;
+		case EGasGiantDebugMode::ZonalError:  Out.DebugScale = ZetaScale * 0.05f; break;
+		default:                              Out.DebugScale = ZetaScale; break;
+		}
+
+		Out.DebugScale = FMath::Max(Out.DebugScale, 1e-6f);
+	}
 
 	// -- Resource handles ---------------------------------------------------
 
-	if (Config->SeedVolume && Config->SeedVolume->GetResource())
+	if (Config->ForcingVolume && Config->ForcingVolume->GetResource())
 	{
-		Out.SeedTexture = Config->SeedVolume->GetResource()->TextureRHI;
+		Out.ForcingTexture = Config->ForcingVolume->GetResource()->TextureRHI;
 	}
 
 	if (Config->FlowTarget)

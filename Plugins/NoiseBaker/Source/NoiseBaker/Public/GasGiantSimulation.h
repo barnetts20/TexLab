@@ -40,6 +40,18 @@ public:
 	/** Discard all state. The next Enqueue rebuilds and re-seeds. */
 	void RequestReset();
 
+	/** Hand the next initialisation a captured state to upload instead of
+	 *  seeding. Consumed once, then dropped.
+	 *
+	 *  Deliberately NOT routed through FGasGiantSimParams. That struct is
+	 *  copied into a render command every frame, and a few megabytes of state
+	 *  used exactly once at init would be paid for on every frame forever. */
+	void QueueRestore_RenderThread(TArray<float>&& InData);
+
+	/** Adds a pass copying the live state into Buffer, and enqueues a readback.
+	 *  Editor-side capture path; the caller flushes and reads. */
+	void AddCapturePass_RenderThread(FRDGBuilder& GraphBuilder, const FGasGiantSimParams& Params, class FRHIGPUBufferReadback* Readback);
+
 	/** True once the initial condition has been constructed. */
 	bool IsInitialised() const { return bInitialised; }
 
@@ -59,6 +71,7 @@ private:
 	bool EnsureResources(const FGasGiantSimParams& Params);
 
 	void AddInitPasses(FRDGBuilder& GraphBuilder, const FGasGiantSimParams& Params, const struct FGasGiantSimResources& R);
+	void AddRestorePass(FRDGBuilder& GraphBuilder, const FGasGiantSimParams& Params, const struct FGasGiantSimResources& R);
 	void AddSubstep(FRDGBuilder& GraphBuilder, const FGasGiantSimParams& Params, struct FGasGiantSimResources& R);
 	void AddPoissonSolve(FRDGBuilder& GraphBuilder, const FGasGiantSimParams& Params, const struct FGasGiantSimResources& R, int32 Iterations);
 	void AddDebugPass(FRDGBuilder& GraphBuilder, const FGasGiantSimParams& Params, const struct FGasGiantSimResources& R);
@@ -75,6 +88,9 @@ private:
 	 *  re-seeds, because there is no meaningful way to resample a vorticity
 	 *  field onto a different grid that is cheaper than starting over. */
 	FIntVector AllocatedGrid = FIntVector::ZeroValue;
+
+	/** Consumed by the next initialisation, then emptied. */
+	TArray<float> PendingRestore;
 
 	bool bInitialised = false;
 	bool bResetRequested = false;

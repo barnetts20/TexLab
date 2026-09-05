@@ -133,65 +133,56 @@ RWTexture2D<float> SimGlobalMeanUAV;
  *  longer needs the gradient, the RGBA16F format or the PotentialGradientScale
  *  reconciliation, because nothing differentiates it analytically any more --
  *  the grid does that. One smooth scalar channel. */
-Texture3D<float4> SimSeedNoise;
-SamplerState SimSeedNoiseSampler;
+/** Band-limited tiling noise, sampled once per texel per step as the stochastic
+ *  forcing. ONE JOB NOW.
+ *
+ *  It used to do two: seed the initial eddy streamfunction as well as force the
+ *  running flow. The seed half is gone, because the two wanted opposite things
+ *  and one stopped being necessary. A streamfunction seed is differentiated
+ *  twice, so a Laplacian amplifies it by k^2 and it wants coarse and smooth;
+ *  forcing is added straight to vorticity and wants fine. And once the jets are
+ *  held sub-marginal, barotropic instability grows eddies from a purely zonal
+ *  start within a few tens of turnovers -- so the seed only ever shortened
+ *  spin-up, which a baked start state removes outright.
+ *
+ *  A baked volume rather than inline PN_FBM because a 3D fetch is roughly four
+ *  times cheaper than two octaves of Perlin, and this runs at every sim texel
+ *  every step. */
+Texture3D<float4> SimForcingNoise;
+SamplerState SimForcingNoiseSampler;
 
-/** Which channel of the seed volume to read. */
-int SimSeedChannel;
-
-/** Channel carrying the small-scale stochastic forcing.
- *
- *  SEPARATE FROM THE SEED CHANNEL BECAUSE THEY WANT OPPOSITE THINGS.
- *
- *  The seed is a STREAMFUNCTION and gets differentiated twice, so a Laplacian
- *  amplifies it by k^2 and it is dominated by the finest scale present. It
- *  wants coarse, smooth, few octaves.
- *
- *  The forcing is added straight to omega with no differentiation at all, and
- *  wants to sit at a SMALL scale -- well below the Rhines wavelength -- so the
- *  inverse cascade has room to organise it into something larger.
- *
- *  Sharing one channel forces a compromise that is wrong for both: coarse
- *  enough to seed cleanly is too coarse to force with, and fine enough to force
- *  with seeds grid-scale hash that the advection removes in a handful of steps. */
+/** Which channel of the volume carries the forcing. */
 int SimForcingChannel;
 
-/** 1 when the baked channel is stored SIGNED, 0 when it is unipolar [0,1].
+/** 1 when the channel is stored SIGNED, 0 when it is unipolar [0,1].
  *
- *  The decode below recentres a unipolar bake with x*2-1. Applied to a channel
- *  baked with bBipolarOutput -- which RGBA16F stores directly, with an identity
- *  decode -- that maps [-1,1] onto [-3,1]: asymmetric, biased, and with double
- *  the intended amplitude. As a streamfunction that is a large spurious
- *  circulation; as forcing it is a constant vorticity source with noise on top.
- *
- *  Worth an explicit flag rather than an assumption because the seed volume
- *  SHOULD be bipolar RGBA16F, so the wrong branch is the one that looks like
- *  the default. */
-int SimSeedBipolar;
+ *  Must match the bake. A unipolar decode applied to a bBipolarOutput channel
+ *  maps [-1,1] onto [-3,1] -- biased, asymmetric, double amplitude -- which as
+ *  forcing is a constant vorticity source with noise riding on it. */
+int SimForcingBipolar;
 
-/** Zero when no seed volume is bound.
+/** Snapshot transfer buffers.
  *
- *  Needed because the decode below recentres a unipolar bake, and a missing
- *  volume binds black, which decodes to a CONSTANT -1 rather than to nothing.
- *  In the initial condition that is harmless -- a constant added to psi has no
- *  gradient -- but in the forcing it is a uniform negative vorticity source
- *  applied every step, cancelled only one step late by the global-mean
- *  subtraction, which uses the previous step's mean.
+ *  A structured buffer rather than an RHI texture update in either direction.
+ *  Buffer readback is a well-trodden path with no per-slice handling, and going
+ *  through a compute pass keeps both directions inside the RDG graph the sim
+ *  already builds -- which means the state is captured at a defined point in
+ *  the step order rather than whenever a copy happened to land.
  *
- *  So an unseeded run was never actually unforced, which quietly invalidates
- *  the one test that is supposed to have an exactly known answer: a purely
- *  zonal field held perfectly static. */
-int SimHasSeed;
+ *  Layout is vorticity for the whole grid, then psi for the whole grid, each
+ *  layer-major then row then column. Both fields in one allocation because they
+ *  are always transferred together and a second buffer would double the
+ *  plumbing for no benefit. */
+StructuredBuffer<float> SimRestoreBuffer;
+RWStructuredBuffer<float> SimCaptureBuffer;
 
-/** Amplitude of the seeded eddy streamfunction, relative to the zonal one. */
-float SimEddyAmplitude;
-
-/** Domain scale for the seed lookup. This sets the SIZE of the seeded eddies
- *  and therefore the scale the inverse cascade starts from; it should sit
- *  comfortably below the Rhines scale the jets imply, or the seed is already
- *  larger than the structures the flow can support and the sim spends its
- *  spin-up taking it apart. */
-float SimSeedScale;
+/** Zero when no volume is bound.
+ *
+ *  The decode recentres a unipolar bake, and a missing volume binds black,
+ *  which decodes to a CONSTANT -1 rather than to nothing. That is a uniform
+ *  vorticity source rather than an absent one, and the solvability projection
+ *  only removes it a step late. */
+int SimHasForcing;
 
 // -- Helpers ----------------------------------------------------------------
 
@@ -212,24 +203,23 @@ float SimPlanetary(float Mu)
     return SimPlanetaryVorticity * Mu;
 }
 
-float SimSampleSeed(float3 UVW, int Channel)
+float SimSampleForcing(float3 UVW)
 {
-    if (SimHasSeed == 0)
+    if (SimHasForcing == 0)
     {
         return 0.0f;
     }
 
-    const float4 S = SimSeedNoise.SampleLevel(SimSeedNoiseSampler, UVW, 0.0f);
+    const float4 S = SimForcingNoise.SampleLevel(SimForcingNoiseSampler, UVW, 0.0f);
 
-    const float Raw = (Channel == 0) ? S.r
-		: (Channel == 1) ? S.g
-		: (Channel == 2) ? S.b : S.a;
+    const float Raw = (SimForcingChannel == 0) ? S.r
+		: (SimForcingChannel == 1) ? S.g
+		: (SimForcingChannel == 2) ? S.b : S.a;
 
-	// Identity for a signed bake, recentre for a unipolar one. Both consumers
-	// want a field centred on zero: a streamfunction with a DC offset is a
-	// constant added to psi, which is harmless, but a forcing with a DC offset
-	// is a uniform vorticity source, which is not.
-    return (SimSeedBipolar != 0) ? Raw : (Raw * 2.0f - 1.0f);
+	// Both branches centre on zero. Forcing with a DC offset is a uniform
+	// vorticity source, which the solvability projection then has to remove
+	// every step.
+    return (SimForcingBipolar != 0) ? Raw : (Raw * 2.0f - 1.0f);
 }
 
 bool SimOutOfBounds(uint3 Id)
@@ -319,24 +309,16 @@ void MainInitZonalPotentialCS(uint3 Id : SV_DispatchThreadID)
     SimRowMeanUAV[int2(Row, Layer)] = Psi;
 }
 
-/** Streamfunction seed: the zonal part plus band-limited eddies.
+/** Broadcast the per-row zonal streamfunction across longitude.
  *
- *  The eddy part is the baked scalar read as a STREAMFUNCTION, which is the
- *  composite-potential idea finally in its right place -- as an initial
- *  condition rather than as the final answer.
+ *  PURELY ZONAL. No eddy seed, deliberately.
  *
- *  ONE SUBTLETY THAT DECIDES WHETHER THE SEED SURVIVES: the eddy volume wants
- *  FEW octaves, not many. Vorticity is the Laplacian of this, and a Laplacian
- *  is a k^2 amplifier, so it is dominated by the smallest scale present rather
- *  than the largest. Seed with a volume carrying octaves down to the texel and
- *  the resulting vorticity is grid-scale hash, which the advection diffuses
- *  away within a handful of steps -- so the sim arrives at a bland zonal field
- *  quickly and it looks exactly as though the seeding did nothing.
- *
- *  A coarse base period and two or three octaves puts the seed's energy at the
- *  eddy scale, which is what should survive. Resolution can go UP freely, since
- *  this volume is now read once at init and has left the per-pixel path
- *  entirely; it is octave count that has to come down.
+ *  Held sub-marginal the jets are barotropically unstable and grow their own
+ *  eddies from round-off within a few tens of turnovers, so a seed only bought
+ *  a shorter spin-up -- at the cost of two parameters that coupled to each
+ *  other and to the noise volume's octave count. Held super-marginal the jets
+ *  are stable and nothing grows from a seed either; the stochastic forcing is
+ *  the eddy source there. Neither regime needed it.
  *
  *  Dispatch (N_lon, N_lat, LayerCount). */
 [numthreads(8, 8, 1)]
@@ -350,49 +332,10 @@ void MainInitPotentialCS(uint3 Id : SV_DispatchThreadID)
     const int2 C = int2(Id.xy);
     const uint Layer = Id.z;
 
-    const float Lon = SimColumnToLon((float) C.x);
-    const float Mu = SimRowToMu((float) C.y);
-
-    const float3 N = SimDirection(Lon, Mu);
-
-	// Decorrelating offset per layer so the stack does not start as three
-	// copies of one eddy field at different strengths, which would couple into
-	// a single columnar structure and lose the vertical shear the stack exists
-	// to provide.
-    const float3 UVW = N * SimSeedScale + float3(0.37f, 0.61f, 0.23f) * (float) Layer;
-
-    const float ZonalPsi = SimRowMeanSRV.Load(int3(C.y, Layer, 0));
-
-	// EDDY AMPLITUDE IS A VELOCITY RATIO, NOT A STREAMFUNCTION AMPLITUDE.
-	//
-	// Velocity is the curl of psi, so it carries one derivative and scales as
-	// k * psi. The seed is read at N * SeedScale with N a unit vector, so one
-	// noise period spans 1/SeedScale radians of arc and the angular wavenumber
-	// is k = 2 pi * SeedScale.
-	//
-	// Scaling psi directly therefore makes the eddy SPEED proportional to
-	// SeedScale, which is the wrong coupling in the worst way: changing the
-	// eddy SIZE silently changes the eddy STRENGTH, so tuning either one
-	// detunes the other and neither converges. At SeedScale 4 the factor is
-	// about 25, which is how a nominal amplitude of 0.05 produced eddies twelve
-	// times faster than the jets -- a field with no visible banding at step
-	// zero, before any instability had a chance to act.
-	//
-	// Dividing it back out makes the parameter mean what its name says: 1.0 is
-	// eddies at roughly jet speed, 0.25 is a quarter of it. SeedScale then
-	// controls size alone and the two are independent.
-	//
-	// APPROXIMATE, and worth knowing where. It uses the seed's BASE wavenumber,
-	// but a multi-octave bake has most of its gradient in the finest octave, so
-	// a volume with several octaves is stronger than this predicts by roughly
-	// the octave span. That is the other reason the seed wants few octaves.
-    const float EddyK = 2.0f * PI * max(SimSeedScale, 1e-3f);
-    const float EddyPsi = SimEddyAmplitude * SimJetParams.y / EddyK;
-
-    SimPsiUAV[int3(C, Layer)] = ZonalPsi + EddyPsi * SimSampleSeed(UVW, SimSeedChannel);
+    SimPsiUAV[int3(C, Layer)] = SimRowMeanSRV.Load(int3(C.y, Layer, 0));
 }
 
-/** Vorticity from the seeded streamfunction, through the SAME discrete
+/** Vorticity from the zonal streamfunction, through the SAME discrete
  *  operator the solver will later invert.
  *
  *  Not the analytic vorticity, deliberately. Taking the grid Laplacian of the
@@ -740,7 +683,7 @@ void MainForceCS(uint3 Id : SV_DispatchThreadID)
 	// an edge case -- unforced and undamped is a different model.
     const float ForcingRate = SimForcingAmplitude * SimDragRate * Profile.z;
 
-    Omega += ForcingRate * SimDeltaTime * SimSampleSeed(ForcingUVW, SimForcingChannel);
+    Omega += ForcingRate * SimDeltaTime * SimSampleForcing(ForcingUVW);
 
 	// -- Vertical coupling --------------------------------------------------
 
@@ -937,6 +880,65 @@ void MainPoissonCS(uint3 Id : SV_DispatchThreadID)
 	// and none is written; a guard here would mask a grid or coefficient error
 	// rather than fix one.
     SimPsiUAV[int3(C, Layer)] = Centre + SimRelaxation * (Source - Applied) / Diagonal;
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot capture and restore
+//
+// WHY THE STATE IS EXACTLY THESE TWO FIELDS.
+//
+// Everything else the sim holds is derived within a step: velocity comes from
+// psi, the row means come from vorticity, the global mean from the row means.
+// So vorticity and psi together are the complete state, and restoring them puts
+// the sim precisely where it was rather than somewhere statistically similar.
+//
+// Psi is stored rather than recovered because recovering it means running the
+// cold-start Poisson solve at load -- slow, and correct only to solver
+// tolerance. Doubling three megabytes is the cheaper trade by a wide margin.
+// ---------------------------------------------------------------------------
+
+/** Flat index into the transfer buffer. Layer-major, then row, then column. */
+int SimFlatIndex(uint3 Id)
+{
+    return (int) Id.z * SimGridSize.x * SimGridSize.y
+		+ (int) Id.y * SimGridSize.x
+		+ (int) Id.x;
+}
+
+/** Dispatch (N_lon, N_lat, LayerCount). */
+[numthreads(8, 8, 1)]
+void MainCaptureCS(uint3 Id : SV_DispatchThreadID)
+{
+    if (SimOutOfBounds(Id))
+    {
+        return;
+    }
+
+    const int Index = SimFlatIndex(Id);
+    const int Total = SimGridSize.x * SimGridSize.y * SimGridSize.z;
+
+    SimCaptureBuffer[Index] = SimVorticitySRV.Load(int4(Id.x, Id.y, Id.z, 0));
+    SimCaptureBuffer[Total + Index] = SimPsiSRV.Load(int4(Id.x, Id.y, Id.z, 0));
+}
+
+/** Dispatch (N_lon, N_lat, LayerCount).
+ *
+ *  Replaces the seeding passes entirely when a snapshot is bound. No Poisson
+ *  solve follows it: psi arrives already consistent with the vorticity it was
+ *  captured alongside, so solving would only move it. */
+[numthreads(8, 8, 1)]
+void MainRestoreCS(uint3 Id : SV_DispatchThreadID)
+{
+    if (SimOutOfBounds(Id))
+    {
+        return;
+    }
+
+    const int Index = SimFlatIndex(Id);
+    const int Total = SimGridSize.x * SimGridSize.y * SimGridSize.z;
+
+    SimVorticityUAV[int3(Id)] = SimRestoreBuffer[Index];
+    SimPsiUAV[int3(Id)] = SimRestoreBuffer[Total + Index];
 }
 
 // ---------------------------------------------------------------------------

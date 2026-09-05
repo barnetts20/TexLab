@@ -4,6 +4,7 @@
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
 #include "RenderTargetPool.h"
+#include "RHIGPUReadback.h"
 #include "GlobalShader.h"
 #include "ShaderParameterStruct.h"
 
@@ -72,12 +73,9 @@ namespace
 		P.SimTime = Params.Time;
 		P.SimPlanetaryVorticity = Params.PlanetaryVorticity;
 
-		P.SimSeedChannel = Params.SeedChannel;
-		P.SimHasSeed = Params.SeedTexture.IsValid() ? 1 : 0;
 		P.SimForcingChannel = Params.ForcingChannel;
-		P.SimSeedBipolar = Params.bSeedBipolar ? 1 : 0;
-		P.SimEddyAmplitude = Params.EddyAmplitude;
-		P.SimSeedScale = Params.SeedScale;
+		P.SimForcingBipolar = Params.bForcingBipolar ? 1 : 0;
+		P.SimHasForcing = Params.ForcingTexture.IsValid() ? 1 : 0;
 
 		P.SimNudgeRate = Params.NudgeRate;
 		P.SimForcingAmplitude = Params.ForcingAmplitude;
@@ -102,14 +100,14 @@ namespace
 		// legitimate state, and a far better failure than refusing to run,
 		// because a running sim with no eddies is diagnosable from the debug
 		// view in one glance and a sim that never started is not.
-		P.SimSeedNoise = Params.SeedTexture.IsValid()
-			? Params.SeedTexture
+		P.SimForcingNoise = Params.ForcingTexture.IsValid()
+			? Params.ForcingTexture
 			: GBlackVolumeTexture->TextureRHI;
 
-		// Wrap on all three axes. The seed volume is a tiling bake and reading
+		// Wrap on all three axes. The forcing volume is a tiling bake and reading
 		// it clamped puts a stretched band of constant value along each face,
 		// which seeds a spurious vorticity sheet there.
-		P.SimSeedNoiseSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
+		P.SimForcingNoiseSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
 	}
 
 	template <typename TShader>
@@ -135,11 +133,34 @@ void FGasGiantSimulation::RequestReset()
 	bResetRequested = true;
 }
 
+void FGasGiantSimulation::QueueRestore_RenderThread(TArray<float>&& InData)
+{
+	check(IsInRenderingThread());
+
+	PendingRestore = MoveTemp(InData);
+
+	// Force the next Enqueue through initialisation so the upload actually
+	// happens, rather than being stranded behind an already-initialised sim.
+	bResetRequested = true;
+}
+
 void FGasGiantSimulation::Release_RenderThread()
 {
 	PooledVorticity[0].SafeRelease();
 	PooledVorticity[1].SafeRelease();
 	PooledPsi.SafeRelease();
+
+	// PendingRestore is DELIBERATELY NOT cleared here.
+	//
+	// QueueRestore_RenderThread sets bResetRequested so the upload is
+	// guaranteed to run, and EnsureResources answers that flag by calling this
+	// function -- so clearing the payload here destroys it with the very reset
+	// that was supposed to apply it. The restore then silently falls through to
+	// seeding, and the only symptom is a planet that does not look like the one
+	// that was saved.
+	//
+	// The payload is owned by the initialisation branch in Enqueue, which
+	// either consumes it or reports it as mismatched and empties it there.
 	PooledRowMean.SafeRelease();
 	PooledGlobalMean.SafeRelease();
 
@@ -243,6 +264,63 @@ void FGasGiantSimulation::AddInitPasses(FRDGBuilder& GraphBuilder, const FGasGia
 
 		AddSimPass<FGasGiantInitVorticityCS>(GraphBuilder, TEXT("GasGiant.InitVorticity"), P, Groups2D);
 	}
+}
+
+void FGasGiantSimulation::AddRestorePass(FRDGBuilder& GraphBuilder, const FGasGiantSimParams& Params, const FGasGiantSimResources& R)
+{
+	const int32 Total = Params.GridSize.X * Params.GridSize.Y * Params.GridSize.Z;
+
+	// CreateStructuredBuffer uploads the initial data as part of graph setup,
+	// so the pass below reads it without a separate transfer step.
+	FRDGBufferRef Upload = CreateStructuredBuffer(
+		GraphBuilder,
+		TEXT("GasGiant.RestoreUpload"),
+		sizeof(float),
+		Total * 2,
+		PendingRestore.GetData(),
+		PendingRestore.Num() * sizeof(float));
+
+	FGasGiantSimParameters* P = GraphBuilder.AllocParameters<FGasGiantSimParameters>();
+	FillCommonParameters(*P, Params);
+	P->SimRestoreBuffer = GraphBuilder.CreateSRV(Upload);
+	P->SimVorticityUAV = GraphBuilder.CreateUAV(R.Vorticity[R.Current]);
+	P->SimPsiUAV = GraphBuilder.CreateUAV(R.Psi);
+
+	AddSimPass<FGasGiantRestoreCS>(GraphBuilder, TEXT("GasGiant.Restore"), P, GroupCount2D(Params.GridSize));
+}
+
+void FGasGiantSimulation::AddCapturePass_RenderThread(FRDGBuilder& GraphBuilder, const FGasGiantSimParams& Params, FRHIGPUBufferReadback* Readback)
+{
+	check(IsInRenderingThread());
+
+	if (!Readback || !PooledPsi.IsValid())
+	{
+		return;
+	}
+
+	const int32 Total = AllocatedGrid.X * AllocatedGrid.Y * AllocatedGrid.Z;
+
+	if (Total <= 0)
+	{
+		return;
+	}
+
+	FRDGTextureRef Vorticity = GraphBuilder.RegisterExternalTexture(PooledVorticity[CurrentVorticity]);
+	FRDGTextureRef Psi = GraphBuilder.RegisterExternalTexture(PooledPsi);
+
+	FRDGBufferRef Capture = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateStructuredDesc(sizeof(float), Total * 2),
+		TEXT("GasGiant.Capture"));
+
+	FGasGiantSimParameters* P = GraphBuilder.AllocParameters<FGasGiantSimParameters>();
+	FillCommonParameters(*P, Params);
+	P->SimVorticitySRV = GraphBuilder.CreateSRV(Vorticity);
+	P->SimPsiSRV = GraphBuilder.CreateSRV(Psi);
+	P->SimCaptureBuffer = GraphBuilder.CreateUAV(Capture);
+
+	AddSimPass<FGasGiantCaptureCS>(GraphBuilder, TEXT("GasGiant.Capture"), P, GroupCount2D(AllocatedGrid));
+
+	AddEnqueueCopyPass(GraphBuilder, Readback, Capture, Total * 2 * sizeof(float));
 }
 
 void FGasGiantSimulation::AddPoissonSolve(FRDGBuilder& GraphBuilder, const FGasGiantSimParams& Params, const FGasGiantSimResources& R, int32 Iterations)
@@ -424,22 +502,50 @@ void FGasGiantSimulation::Enqueue_RenderThread(FRDGBuilder& GraphBuilder, const 
 
 	if (bNeedsSeeding || !bInitialised)
 	{
-		AddInitPasses(GraphBuilder, Params, R);
+		if (PendingRestore.Num() == Params.GridSize.X * Params.GridSize.Y * Params.GridSize.Z * 2)
+		{
+			// Restored, not seeded. No Poisson solve follows: psi arrives
+			// already consistent with the vorticity it was captured beside, so
+			// solving could only move it away from the captured state.
+			AddRestorePass(GraphBuilder, Params, R);
 
-		// The one cold start. No previous psi to warm start from, so this runs
-		// many more sweeps than a substep does -- and it is off the frame
-		// budget, so it can afford to.
-		//
-		// Note that psi already holds the seeded streamfunction, so even this
-		// is not truly cold: the vorticity was built by applying the discrete
-		// Laplacian to that psi, which puts the source exactly in the range of
-		// the operator, so the solve should converge almost immediately and the
-		// residual view should be featureless on the very first frame. If it is
-		// not, the discretisation and the seeding disagree, which is a far more
-		// specific bug than "the sim looks wrong".
-		AddPoissonSolve(GraphBuilder, Params, R, FMath::Max(Params.InitPoissonIterations, 1));
+			UE_LOG(LogGasGiantSim, Log, TEXT("Restored state from snapshot."));
 
-		bInitialised = true;
+			PendingRestore.Empty();
+			bInitialised = true;
+		}
+		else
+		{
+			if (PendingRestore.Num() > 0)
+			{
+				UE_LOG(LogGasGiantSim, Warning,
+					TEXT("Snapshot has %d floats, grid needs %d. Seeding instead."),
+					PendingRestore.Num(),
+					Params.GridSize.X * Params.GridSize.Y * Params.GridSize.Z * 2);
+
+				PendingRestore.Empty();
+			}
+
+			AddInitPasses(GraphBuilder, Params, R);
+
+			// The one cold start. No previous psi to warm start from, so this
+			// runs many more sweeps than a substep does, and it is off the
+			// frame budget so it can afford to.
+			//
+			// It is not truly cold either: psi already holds the zonal
+			// streamfunction and the vorticity was built by applying the
+			// discrete Laplacian to exactly that, which puts the source in the
+			// range of the operator. So it should converge almost immediately,
+			// and a residual view that is not featureless on frame one means
+			// the discretisation and the seeding disagree -- a far more
+			// specific bug than "the sim looks wrong".
+			//
+			// The restore branch above skips this entirely, which is most of
+			// why storing psi alongside vorticity is worth the extra megabytes.
+			AddPoissonSolve(GraphBuilder, Params, R, FMath::Max(Params.InitPoissonIterations, 1));
+
+			bInitialised = true;
+		}
 	}
 
 	for (int32 Step = 0; Step < NumSubsteps; ++Step)

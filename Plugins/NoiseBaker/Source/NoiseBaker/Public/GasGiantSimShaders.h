@@ -42,13 +42,10 @@ SHADER_PARAMETER(float, SimDeltaTime)
 SHADER_PARAMETER(float, SimTime)
 SHADER_PARAMETER(float, SimPlanetaryVorticity)
 
-// -- Seed ---------------------------------------------------------------
-SHADER_PARAMETER(int32, SimSeedChannel)
-SHADER_PARAMETER(int32, SimHasSeed)
+// -- Forcing volume -----------------------------------------------------
 SHADER_PARAMETER(int32, SimForcingChannel)
-SHADER_PARAMETER(int32, SimSeedBipolar)
-SHADER_PARAMETER(float, SimEddyAmplitude)
-SHADER_PARAMETER(float, SimSeedScale)
+SHADER_PARAMETER(int32, SimForcingBipolar)
+SHADER_PARAMETER(int32, SimHasForcing)
 
 // -- Forcing ------------------------------------------------------------
 SHADER_PARAMETER(float, SimNudgeRate)
@@ -86,8 +83,11 @@ SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float>, SimRowMeanUAV)
 SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float>, SimGlobalMeanUAV)
 SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, SimDebugUAV)
 
-SHADER_PARAMETER_TEXTURE(Texture3D, SimSeedNoise)
-SHADER_PARAMETER_SAMPLER(SamplerState, SimSeedNoiseSampler)
+SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, SimRestoreBuffer)
+SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, SimCaptureBuffer)
+
+SHADER_PARAMETER_TEXTURE(Texture3D, SimForcingNoise)
+SHADER_PARAMETER_SAMPLER(SamplerState, SimForcingNoiseSampler)
 
 END_SHADER_PARAMETER_STRUCT()
 
@@ -138,6 +138,8 @@ GG_DECLARE_SIM_SHADER(FGasGiantReduceGlobalCS)
 GG_DECLARE_SIM_SHADER(FGasGiantForceCS)
 GG_DECLARE_SIM_SHADER(FGasGiantPolarFilterCS)
 GG_DECLARE_SIM_SHADER(FGasGiantPoissonCS)
+GG_DECLARE_SIM_SHADER(FGasGiantCaptureCS)
+GG_DECLARE_SIM_SHADER(FGasGiantRestoreCS)
 GG_DECLARE_SIM_SHADER(FGasGiantDebugVisCS)
 
 #undef GG_DECLARE_SIM_SHADER

@@ -47,6 +47,8 @@ GG_IMPLEMENT_SIM_SHADER(FGasGiantReduceGlobalCS, "MainReduceGlobalCS")
 GG_IMPLEMENT_SIM_SHADER(FGasGiantForceCS, "MainForceCS")
 GG_IMPLEMENT_SIM_SHADER(FGasGiantPolarFilterCS, "MainPolarFilterCS")
 GG_IMPLEMENT_SIM_SHADER(FGasGiantPoissonCS, "MainPoissonCS")
+GG_IMPLEMENT_SIM_SHADER(FGasGiantCaptureCS, "MainCaptureCS")
+GG_IMPLEMENT_SIM_SHADER(FGasGiantRestoreCS, "MainRestoreCS")
 GG_IMPLEMENT_SIM_SHADER(FGasGiantDebugVisCS, "MainDebugVisCS")
 
 #undef GG_IMPLEMENT_SIM_SHADER
