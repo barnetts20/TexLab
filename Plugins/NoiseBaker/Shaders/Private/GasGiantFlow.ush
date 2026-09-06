@@ -4,7 +4,7 @@
 
 
 // ---------------------------------------------------------------------------
-// Gas giant banding and flow. Three baked volumes, one Custom node.
+// Gas giant banding and flow. One baked volume, one simulated flow field.
 //
 // WHY GAS GIANTS BAND, since the whole design follows from it.
 //
@@ -301,20 +301,13 @@ float GG_DensityRamp(float Depth, float Ramp, float Curve, float Core)
 
 /** Cloud top altitude, as a fraction of the shell thickness.
  *
- *  THE DECK, AND NOTHING BUT THE DECK. Built entirely from the simulated flow:
- *  band elevation, pressure lift, storm towers. No detail noise appears here.
+ *  Flow first: band elevation, pressure lift, storm towers. Then the detail
+ *  carve, in the same form the density function uses.
  *
- *  It used to. The detail was summed into the elevation and the whole thing
- *  multiplied by BandRelief, which coupled two unrelated knobs -- and worse,
- *  turned a 3D noise field into a displacement of a 2D surface. A volume
- *  sampled at a unit direction is a spherical SLICE through it: all the
- *  vertical structure that was baked in gets discarded, and a bespoke radial
- *  displacement is invented to replace it. That is strictly worse than the
- *  structure already in the volume, and it is what made the detail read as
- *  spikes.
- *
- *  The detail now modulates DENSITY inside the deck instead, sampled at the
- *  true 3D position. See GG_Density.
+ *  DetailRelief is separate from BandRelief on purpose. The two were once
+ *  summed before the relief multiply, so raising BandRelief for thicker bands
+ *  multiplied the fine noise by the same factor -- and a noise field stretched
+ *  vertically but not horizontally becomes spikes.
  *
  *  Relief is float4(TopBase, BandRelief, PressureLift, StormTowers).
  *
@@ -398,7 +391,7 @@ float GG_CloudTop(
 /** Evaluates the cloud field at a direction on the sphere.
  *
  *  Returns:
- *    x  Cloud top altitude, as a fraction of the shell thickness. Flow only.
+ *    x  Cloud top altitude, as a fraction of the shell thickness.
  *    y  Pressure. Negative is a low, so cyclonic; extrema are vortex centres
  *       and the circulation already matches them.
  *    z  BAND, signed and unclamped. Negative is one band type, positive the
@@ -409,7 +402,7 @@ float GG_CloudTop(
  *  Scales  float4(DetailScale, PackedScale, DetailWarpInherit, PackedWarpInherit)
  *  Warps   float4(WarpTime, DetailWarp, BandJitter, TurbulenceFloor)
  *  Detail  float4(Ridge, Mottle, Wisp, EdgeBias)
- *  Layers  float3(FlowLayer, DeepFlowLayer, unused)
+ *  Layers  float3(FlowLayer, DeepFlowLayer, DeckSlope)
  *
  *  Three fetches per evaluation, against eight before. */
 float4 GG_Field(
@@ -861,13 +854,14 @@ float GG_Spot(float3 N, float3 Centre, float Radius, float Strength)
 // in the height field. Under a march it becomes surface relief along the cliffs
 // between decks, which is where a real gas giant's texture lives.
 //
-// COMPOSITION IS NOT A DENSITY TERM.
+// THE BAND IS NOT A DENSITY TERM EITHER.
 //
-// Packed.a is a chemistry marker. It says what the material IS, not how much
-// of it there is, so it belongs in extinction or scattering colour, not in the
-// density field. It is passed straight through below rather than composited.
-// Folding it in would make chemically distinct regions physically thinner,
-// which is wrong and, worse, would look almost right.
+// It says what the material IS, not how much of it there is, so it belongs in
+// extinction and scattering colour -- which is exactly where the three
+// scattering parameter sets will read it from. It is passed straight through
+// below rather than composited. Folding it into density would make band
+// families physically thinner, which is wrong and, worse, would look almost
+// right.
 // ---------------------------------------------------------------------------
 
 
@@ -883,22 +877,22 @@ float GG_Spot(float3 N, float3 Centre, float Radius, float Strength)
  *
  *  StepHalfLength is half the march step, expressed in SHELL FRACTIONS along
  *  the radius -- the amount of altitude this sample is responsible for. The
- *  envelope is integrated across it so a step straddling the cloud top is
+ *  density ramp is integrated across it so a step straddling the cloud top is
  *  weighted by how much of it lies inside, rather than counted or discarded
  *  whole.
  *
  *  Returns:
  *    x  Density in [0,1]. Multiply by an extinction coefficient in the march.
- *    y  BAND MASK, for the colour ramp. NOT a density term.
+ *    y  BAND, signed. For GG_BandColour. NOT a density term.
  *    z  Pressure, for tinting vortices.
  *    w  The deck top at this column, as a shell fraction. The march uses it to
  *       skip the empty space above the deck instead of stepping through it.
  *
- *  Note the march wants BandSharpness low -- around 0.8. High sharpness
- *  saturates Band toward 0 and 1, which turns the height field into two flat
- *  terraces joined by a cliff and throws away the relief this exists to
- *  produce. Sharpness was doing the work of contrast back when the output was
- *  brightness; here geometry does it instead. */
+ *  BandSharpness multiplies the already-normalized vorticity, so 1 is neutral
+ *  and the useful range is roughly 0.5 to 3. Too high flattens the elevation
+ *  toward its asymptote everywhere but the band boundaries, which turns the
+ *  height field into terraces joined by cliffs and throws away the relief this
+ *  exists to produce. */
 float4 GG_Density(
 	Texture2DArray FlowField,
 	SamplerState FlowSampler,
@@ -935,15 +929,6 @@ float4 GG_Density(
 		Height, BandSharpness, ReliefThinning, DetailVertical, DetailRelief, Relief, Profile.z);
 
     const float Top = Field.x;
-
-	// Solid below the deck, fading above it. No lower bound is applied: the
-	// interior is opaque and never seen, and fading density toward the base
-	// would carve a hollow that only shows up as a wrong silhouette at the limb.
-	//
-	// Smoothstep rather than a linear ramp. The linear form is C0 at both ends,
-	// and those two kinks are visible as hard lines at the cloud top and at the
-	// point the deck goes solid -- the top one especially, since it is the
-	// silhouette. Softening the curve buys more apparent softness than raising
 
 	// THE RAMP IS INTEGRATED ACROSS THE STEP, NOT SAMPLED AT ITS MIDPOINT.
 	//
@@ -1039,17 +1024,18 @@ float4 GG_Density(
 //
 // THE SPAN IS ANALYTICALLY THIN, WHICH IS WHAT MAKES THIS AFFORDABLE.
 //
-// Each density sample here costs six texture fetches, against one for the box
-// marcher. Stepping the whole atmosphere at that price would be hopeless.
+// Each density sample here costs three texture fetches, against one for the
+// box marcher. Stepping the whole atmosphere at that price would be hopeless.
 //
 // It is not necessary. GG_CloudTop is a bounded expression: Band and Pressure
 // are both bounded, and the storm term is one-sided, so the highest and lowest
 // the deck can possibly reach are known in closed form from Relief alone. Above
-// TopMax there is provably nothing. Below TopMin minus the softness width,
-// density is provably saturated and the view can never reach further.
+// TopMax there is provably nothing, so the cull sphere sits exactly there.
 //
-// So the only span worth marching is the thin band between those two radii,
-// and everything outside it is skipped without a single sample. This is the
+// There is no inner bound: the deck is solid all the way down and the ray ends
+// on transmittance. What keeps that affordable is the empty-space skip, which
+// jumps a ray straight to the deck rather than stepping through the vacuum a
+// grazing ray would otherwise cross. This is the
 // same argument the baker's brick bounds make -- bound the field, then use the
 // bound to avoid sampling it -- applied to an analytic term rather than a baked
 // one, which makes it exact rather than conservative.
@@ -1128,6 +1114,57 @@ bool GG_RaySphere(float3 Origin, float3 Dir, float Radius, out float T0, out flo
     return true;
 }
 
+/** A conservative UPPER BOUND on the cloud top at one direction, from a single
+ *  flow fetch.
+ *
+ *  Used to find where a ray enters the deck, which is a different job from
+ *  integrating it and wants a different tool.
+ *
+ *  WHY AN UPPER BOUND AND NOT THE VALUE. A search that overestimates the deck
+ *  stops short and takes another iteration; one that underestimates steps over
+ *  the surface and misses cloud entirely. Only one of those is recoverable, so
+ *  every term here is taken at its most generous:
+ *
+ *    - ReliefScale is in [0,1] and multiplies a term that changes sign, so the
+ *      band contribution is max(Relief.y * (Elevation - 0.5), 0).
+ *    - The storm tower is taken at full height wherever its gate is open,
+ *      rather than fetching the cell mask that would thin it.
+ *    - The detail carve is omitted, which is safe precisely because it only
+ *      ever LOWERS the deck.
+ *
+ *  ONE FETCH, not three. The deck is dominated by the flow; the two baked
+ *  volume reads only refine it, and refinement is exactly what a conservative
+ *  search does not need. That makes the search phase cheaper per iteration than
+ *  the march it replaces. */
+float GG_CloudTopUpper(
+	Texture2DArray FlowField,
+	SamplerState FlowSampler,
+	float3 P,
+	float Time,
+	float RigidRate,
+	float FlowLayer,
+	float BandBias,
+	float BandSharpness,
+	float4 Relief,
+	float VortexThreshold)
+{
+    const float3 N = normalize(GG_RotateZ(P, -RigidRate * Time));
+
+    const float4 Flow = GG_SampleFlow(FlowField, FlowSampler, N, FlowLayer);
+
+    const float Zeta = (Flow.w + BandBias) * BandSharpness;
+    const float Elevation = 1.0f - exp(-Zeta * Zeta);
+    const float Pressure = Flow.z;
+
+    float Top = Relief.x + max(Relief.y * (Elevation - 0.5f), 0.0f);
+
+    Top += Relief.z * Pressure;
+
+    Top += max(Relief.w, 0.0f) * smoothstep(VortexThreshold, 1.0f, abs(Pressure));
+
+    return Top;
+}
+
 /** Closed-form bounds on the cloud top, used to make the marched span thin.
  *
  *  EVERY TERM IN GG_CloudTop HAS TO APPEAR HERE. An underestimate is not a
@@ -1138,12 +1175,7 @@ bool GG_RaySphere(float3 Origin, float3 Dir, float Radius, out float T0, out flo
  *  Elevation is in [0,1], so the band contributes half of Relief.y either side
  *  of the base. Pressure is soft-saturated to [-1,1] sim-side, so it
  *  contributes the whole of Relief.z. ReliefScale never exceeds one, so
- *  ignoring it is conservative in the safe direction.
- *
- *  The detail is absent because it no longer moves the deck -- it modulates
- *  density beneath it, which cannot extend the surface upward and therefore
- *  cannot break this bound. That is the property that keeps the marched span
- *  analytically thin. */
+ *  ignoring it is conservative in the safe direction. */
 void GG_TopBounds(float4 Relief, float DetailRelief, out float OutMin, out float OutMax)
 {
     const float Span = 0.5f * abs(Relief.y) + abs(Relief.z);
@@ -1177,8 +1209,10 @@ void GG_TopBounds(float4 Relief, float DetailRelief, out float OutMin, out float
  *  InStepGrowth    Step growth across the marched span.
  *  InMaxSteps      Safety bound. Set to int(StepBudget) + 8.
  *  InPixelPos      Parameters.SvPosition.xy at the Custom node.
- *  InJitterAmount  0 disables the jitter, 1 applies it fully. Anything in
- *                  between mixes toward no offset.
+ *  InJitterAmount  Scales the per-step offset. 1 is correct and not a
+ *                  compromise: the offset stays inside the step it represents,
+ *                  so the estimator is unbiased. Reducing it puts the sampling
+ *                  lattice back, which is what produces slicing.
  *
  *  Returns float4:
  *    x  Cloud top altitude at the visible surface. Use it for shading relief
@@ -1257,10 +1291,6 @@ float4 GG_March(
 	// avoid marching that emptiness and for no other reason -- nothing is
 	// clipped by it and nothing terminates on it.
 	//
-	// A softness of margin on top. Not needed for correctness, but it puts the
-	// ray's first sample clear of the density boundary rather than exactly on
-	// it, so the march has a run-up and the entry point stops coinciding with
-	// the one place the field is discontinuous in its derivative.
 	// NO MARGIN. Density is exactly zero above Top and Top can never exceed
 	// TopMax, so anything outside this radius is provably empty and padding it
 	// only lengthens the chord a grazing ray has to cross.
@@ -1357,12 +1387,6 @@ float4 GG_March(
     const float Growth = max(InStepGrowth, 0.0f);
     const float InvSpan = 1.0f / ReferenceSpan;
 
-	// Shortens the first step only, offsetting each pixel's lattice so the
-	// sampling grid does not read as banding. Costs no energy: the final step
-	// clamps to the exit, so total path length is unchanged.
-	//
-	// Lerped from 1 rather than used directly, so an amount of 0 means no
-	// offset at all rather than a zero-length first step.
     const float RaySeed = GG_RaySeed(InPixelPos);
     const float JitterAmount = saturate(InJitterAmount);
 
@@ -1395,7 +1419,97 @@ float4 GG_March(
 	// is stable without needing to be sharp.
     float TopAccum = 0.0f;
 
-    float T = TStart;
+	// -- Search: find where the ray enters the deck -------------------------
+	//
+	// SEPARATE FROM THE MARCH, AND DETERMINISTIC, WHICH IS THE POINT.
+	//
+	// This used to be a skip inside the accumulation loop, and mixing the two
+	// jobs is what made every fix produce a new artifact. A search wants to be
+	// deterministic and convergent; an integrator wants to be jittered and
+	// unbiased. Sharing one loop means every guard added for one becomes a
+	// visible locus for the other -- a HARD edge where a deterministic
+	// threshold fires, a DITHERED edge where a jittered step decides whether a
+	// ray accumulates at all. Both were visible at once, on opposite sides of
+	// the same band, which is what gave the split away.
+	//
+	// Separated, each does its own job. The search crosses a region that is
+	// provably empty, so it contributes no light and needs no jitter; the march
+	// starts from a smoothly varying entry point and carries the only jitter in
+	// the system.
+	//
+	// Sphere-traced against the conservative upper bound, ONE fetch per
+	// iteration rather than three. The factor is below one because that bound
+	// is vertical only and the deck also varies HORIZONTALLY -- a ray descending
+	// toward a low column may pass over a taller one on the way.
+    float TSearch = TStart;
+
+	[loop]
+    for (int Probe = 0; Probe < 24; Probe++)
+    {
+        const float3 ProbePos = Origin + Dir * TSearch;
+        const float ProbeRadius = length(ProbePos);
+        const float ProbeHeight = (ProbeRadius - PlanetRadius) / Thickness;
+
+        const float3 ProbeDir = ProbePos / max(ProbeRadius, 1e-4f);
+        const float ProbeRate = dot(Dir, ProbeDir);
+
+        const float TopUpper = GG_CloudTopUpper(
+			FlowField, FlowSampler, ProbeDir, Time, RigidRate,
+			Layers.x, Warps.z, BandSharpness, Relief, Profile.z);
+
+		// Inside the deck. The march takes over from here.
+        if (ProbeHeight <= TopUpper)
+        {
+            break;
+        }
+
+		// Climbing AND clear of the highest the deck can ever reach. Both
+		// conditions matter: a climbing ray still inside the deck's range can
+		// meet a taller column ahead, so ProbeRate alone is not enough to say
+		// nothing is left.
+        if (ProbeRate >= 0.0f && ProbeHeight > TopMax)
+        {
+            return Miss;
+        }
+
+		// THE DECK RISES TO MEET THE RAY, AND THAT HAS TO BE IN THE DENOMINATOR.
+		//
+		// Dividing the gap by the descent rate alone assumes the ray closes it
+		// by DESCENDING. Near tangent it barely descends, so that advance goes
+		// to infinity -- and yet the ray still reaches the deck, because the
+		// deck climbs toward it. The trace overshot by orders of magnitude on
+		// exactly those rays, landing at an entry point that jumped around with
+		// view angle, which drew slices along tangent-aligned directions.
+		//
+		// A ray closes the gap at the sum of two rates: its own descent, and
+		// the deck's rise across the ground it covers. With the deck's slope
+		// bounded by DeckSlope in shell fractions per radian, the horizontal
+		// half converts through Thickness / Radius -- shell per radian into
+		// local per local, matching the descent rate's units.
+		//
+		// At tangent the descent term vanishes and the slope term carries it,
+		// which is what makes the advance finite there instead of unbounded.
+		// This is a cone trace rather than a sphere trace, and the cone angle
+		// is what the deck's own roughness allows.
+        const float Horizontal = sqrt(max(1.0f - ProbeRate * ProbeRate, 0.0f));
+
+        const float ClosingRate = -ProbeRate
+			+ Horizontal * max(Layers.z, 0.1f) * Thickness / max(ProbeRadius, 1e-4f);
+
+        const float Advance = (ProbeHeight - TopUpper) * Thickness / max(ClosingRate, 1e-5f);
+
+		// 0.9 rather than a full step: the bound is conservative but DeckSlope
+		// is authored, and an under-declared slope is the one way this can
+		// still step over the surface.
+        TSearch += max(Advance * 0.9f, 1e-4f);
+
+        if (TSearch >= TExit)
+        {
+            return Miss;
+        }
+    }
+
+    float T = TSearch;
     float StepsTaken = 0.0f;
 
 	[loop]
@@ -1416,9 +1530,6 @@ float4 GG_March(
 
         StepsTaken += 1.0f;
 
-		// Midpoint sample. With steps that grow, sampling at the near edge
-		// weights every interval by its own leading face and biases the
-		// integral toward the camera.
 		// Sampled at the step centre plus a jittered offset within the step, so
 		// the sample stays inside the interval it represents -- stratified,
 		// unbiased, and off the lattice.
@@ -1434,6 +1545,9 @@ float4 GG_March(
 
 		// How fast altitude changes per unit of ray length. Near zero for a
 		// grazing ray, which is exactly the case the skip below has to handle.
+		// Magnitude only. The sign mattered when the skip lived in this loop;
+		// the search owns that now, and all this feeds is the step's altitude
+		// extent, which is symmetric.
         const float RadialRate = abs(dot(Dir, SampleDir));
 
         const float SampleHeight = (length(SamplePos) - PlanetRadius) / Thickness;
@@ -1488,12 +1602,13 @@ float4 GG_March(
 		// Guarded on RadialRate rather than trusting the divide -- a ray running
 		// exactly tangent changes altitude at no rate at all, and the distance
 		// to a deck it never descends toward is not finite.
-        if (SampleHeight > Field.w && RadialRate > 1e-3f)
-        {
-            const float ToDeck = (SampleHeight - Field.w) * Thickness / RadialRate;
-
-            StepLen = max(StepLen, min(ToDeck * 0.5f, Remaining));
-        }
+		// NO SKIP HERE, AND NO DIRECTION GUARD EITHER.
+		//
+		// The search above already placed the ray at the deck. A ray that
+		// climbs back out mid-march is rare enough that stepping the gap costs
+		// less than another threshold would -- and every threshold in this loop
+		// is a locus, which is what the last several rounds of artifacts all
+		// turned out to be.
 
         T += StepLen;
     }
