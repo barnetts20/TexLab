@@ -330,6 +330,8 @@ float GG_DensityRamp(float Depth, float Ramp, float Curve, float Core)
  *  reads as plausible until you notice every storm is a pit. */
 float GG_CloudTop(
 	float Elevation,
+	float Shape,
+	float DetailRelief,
 	float Pressure,
 	float StormCells,
 	float ReliefScale,
@@ -341,6 +343,43 @@ float GG_CloudTop(
 	// point of driving height from the flow is that the bands are geometry
 	// rather than a pattern painted on a sphere.
     float Top = Relief.x + ReliefScale * Relief.y * (Elevation - 0.5f);
+
+	// DETAIL AS SURFACE RELIEF, WHICH IS A DIFFERENT EFFECT FROM THE CARVE.
+	//
+	// Displacing the deck gives a lumpy SURFACE with a sharp top; eroding the
+	// density gives a soft, penetrable skin. They are not two ways of doing one
+	// thing and both are worth having, so both are here with separate amounts.
+	//
+	// ONE CAVEAT WORTH KNOWING. With DetailVertical above zero the shape varies
+	// with altitude, so this "top" is not a single surface -- it is a threshold
+	// that shifts slightly along the ray. That is a blur rather than an error:
+	// the ramp starts at a different depth for each sample, which softens the
+	// top instead of defining it sharply. At DetailVertical zero the sample is
+	// columnar and the deck is a true heightfield with a crisp silhouette.
+	//
+	// Which of those is wanted is a look decision, and DetailVertical is where
+	// it gets made.
+	//
+	// EXACTLY THE FORM THE DENSITY CARVE USES, expressed as altitude.
+	//
+	// The density carve is lerp(1, Shape, amount): it pulls density DOWN where
+	// Shape is low and leaves it alone where Shape is one. This is the same
+	// statement about height -- the deck drops by DetailRelief where Shape is
+	// zero and is untouched where Shape is one.
+	//
+	// Same Shape, so it is already edge-weighted and already the mix of all
+	// three detail channels. One noise, two consequences: the deck's SHAPE and
+	// the skin's DENSITY.
+	//
+	// Subtractive rather than centred. A centred displacement raises as much as
+	// it lowers, which just re-tunes Relief.x on average and makes the two
+	// applications disagree about which way the noise cuts. Carving down only
+	// also keeps the bound tight: TopMax is untouched, so the grazing chord
+	// does not grow.
+	//
+	// Not scaled by ReliefScale, matching the density carve, which is not
+	// either. Strain thins the BAND relief; it has no claim on the detail.
+    Top -= DetailRelief * (1.0f - Shape);
 
     Top += Relief.z * Pressure;
 
@@ -389,6 +428,7 @@ float4 GG_Field(
 	float BandSharpness,
 	float ReliefThinning,
 	float DetailVertical,
+	float DetailRelief,
 	float4 Relief,
 	float VortexThreshold)
 {
@@ -667,12 +707,24 @@ float4 GG_Field(
 
 	// 1 in band interiors, falling toward the mix at the transitions. So the
 	// detail breaks up the edges and leaves the zone interiors coherent.
+	//
+	// THE SAME SHAPE DRIVES BOTH THE DECK AND THE DENSITY, because they are
+	// different effects rather than two ways of doing one thing. Displacing the
+	// deck moves where the density ramp STARTS, which changes the silhouette
+	// and the shape of the top. Carving the density changes HOW MUCH is there
+	// once the ramp has begun, which softens the skin without moving the
+	// surface. Running one noise through both is what gives lumps that are also
+	// wispy, rather than lumps with a smooth skin or a smooth deck with
+	// wispiness painted on it.
     const float Shape = lerp(1.0f, Mix, Edge);
+
+
 
 	// Top is assembled HERE rather than in the density function, because the
 	// storm cell mask is Packed.g and Packed only exists in this scope.
     const float Top = GG_CloudTop(
-		Elevation, Pressure, Packed.g, ReliefScale, Relief, VortexThreshold);
+		Elevation, Shape, DetailRelief, Pressure, Packed.g,
+		ReliefScale, Relief, VortexThreshold);
 
     return float4(Top, Pressure, BandSigned, Shape);
 }
@@ -864,6 +916,7 @@ float4 GG_Density(
 	float ReliefThinning,
 	float DetailVertical,
 	float DetailErosion,
+	float DetailRelief,
 	float DetailDepth,
 	float StepHalfLength,
 	float DensityCurve,
@@ -879,7 +932,7 @@ float4 GG_Density(
     const float4 Field = GG_Field(
 		FlowField, FlowSampler, PackedDetail, PackedSampler,
 		Direction, Time, RigidRate, Scales, Warps, Detail, Layers,
-		Height, BandSharpness, ReliefThinning, DetailVertical, Relief, Profile.z);
+		Height, BandSharpness, ReliefThinning, DetailVertical, DetailRelief, Relief, Profile.z);
 
     const float Top = Field.x;
 
@@ -1005,28 +1058,48 @@ float4 GG_Density(
 // than of the atmosphere, which is the only thing visible at 100% coverage.
 // ---------------------------------------------------------------------------
 
-/** Interleaved gradient noise, from pixel coordinates.
+/** Per-pixel seed for the march, from the integer pixel coordinate.
  *
- *  Computed here rather than fed in, because the only thing a caller could
- *  usefully supply is the pixel position, and it is already in scope at the
- *  Custom node as Parameters.SvPosition. A separate node to produce this was a
- *  node whose entire job was to be forgotten and left at a constant, which
- *  silently disables the jitter and looks exactly like a marcher with too few
- *  steps.
+ *  A proper integer hash rather than the frac-of-a-large-multiple trick that
+ *  was here before. That one is cheap and adequate for a single offset, but it
+ *  correlates badly under the repeated advance below -- neighbouring pixels
+ *  take similar walks through the sequence, which is exactly the case that
+ *  needs them not to.
  *
- *  IGN rather than a hash: its output is decorrelated between neighbouring
- *  pixels but low-discrepancy over any small block, so the error averages out
- *  across a few pixels instead of turning into salt-and-pepper. That matters
- *  because the thing being hidden is a sampling lattice, which is itself a
- *  block-scale artifact.
- *
- *  Spatial only. Adding View.StateFrameIndexMod8 to the dot product gives a
- *  temporally varying version, which is better under TAA and reads as flicker
- *  without it. */
-float GG_Jitter(float2 PixelPos)
+ *  Lifted from the atmosphere raymarcher so both use the same sequence. */
+float GG_RaySeed(float2 PixelPos)
 {
-    return frac(52.9829189f * frac(dot(PixelPos, float2(0.06711056f, 0.00583715f))));
+    const uint2 P = (uint2) PixelPos;
+
+    uint Seed = P.x * 1664525u + P.y * 1013904223u;
+    Seed = (Seed ^ (Seed >> 16)) * 2654435769u;
+    Seed = (Seed ^ (Seed >> 16));
+
+    return (float) Seed / 4294967295.0f;
 }
+
+/** Offset for one step, in [-0.5, 0.5] before scaling.
+ *
+ *  EVERY STEP IS JITTERED, NOT JUST THE FIRST. This is the whole reason the
+ *  deck was slicing.
+ *
+ *  Offsetting only the first step translates the sampling lattice per pixel,
+ *  which decorrelates neighbouring rays but leaves each ray on a perfectly
+ *  regular grid. A regular grid beats against any structure with a comparable
+ *  period, and the density ramp has exactly that -- so the deck came out in
+ *  layers at the step spacing, stable in world space and therefore reading as
+ *  geometry rather than as noise.
+ *
+ *  Advancing the seed by the golden ratio each step turns the ray's samples
+ *  into a low-discrepancy sequence instead: still stratified, one sample per
+ *  step, but with no period for the field to resonate with. The 0.618033
+ *  advance is the standard choice because its continued fraction converges
+ *  slowest, which is the formal statement of having no short period. */
+float GG_StepJitter(float Seed, int StepIndex)
+{
+    return frac(Seed + (float) StepIndex * 0.618033f) - 0.5f;
+}
+
 
 /** Ray against a sphere centred on the origin. Direction must be normalized.
  *
@@ -1071,11 +1144,19 @@ bool GG_RaySphere(float3 Origin, float3 Dir, float Radius, out float T0, out flo
  *  density beneath it, which cannot extend the surface upward and therefore
  *  cannot break this bound. That is the property that keeps the marched span
  *  analytically thin. */
-void GG_TopBounds(float4 Relief, out float OutMin, out float OutMax)
+void GG_TopBounds(float4 Relief, float DetailRelief, out float OutMin, out float OutMax)
 {
     const float Span = 0.5f * abs(Relief.y) + abs(Relief.z);
 
-    OutMin = Relief.x - Span;
+	// The detail carve is subtractive: Shape is in [0,1] and enters as
+	// (1 - Shape), so it lowers the deck by at most DetailRelief and never
+	// raises it. It therefore belongs in the LOWER bound only.
+	//
+	// That is worth having deliberately rather than by accident. A symmetric
+	// term would push TopMax up, and TopMax sets the cull radius -- so it would
+	// lengthen the chord every grazing ray has to cross, for lumps that only
+	// ever cut downward.
+    OutMin = Relief.x - Span - abs(DetailRelief);
     OutMax = Relief.x + Span + max(Relief.w, 0.0f);
 }
 
@@ -1144,6 +1225,7 @@ float4 GG_March(
 	float ReliefThinning,
 	float DetailVertical,
 	float DetailErosion,
+	float DetailRelief,
 	float DetailDepth,
 	float DensityCurve,
 	float4 Relief,
@@ -1166,7 +1248,7 @@ float4 GG_March(
 	// -- Shell bounds -------------------------------------------------------
 
     float TopMin, TopMax;
-    GG_TopBounds(Relief, TopMin, TopMax);
+    GG_TopBounds(Relief, DetailRelief, TopMin, TopMax);
 
 	// THE ONLY SPHERE, AND IT IS A CULL, NOT A BOUNDARY.
 	//
@@ -1281,8 +1363,8 @@ float4 GG_March(
 	//
 	// Lerped from 1 rather than used directly, so an amount of 0 means no
 	// offset at all rather than a zero-length first step.
-    const float Noise = GG_Jitter(InPixelPos);
-    const float FirstScale = clamp(lerp(1.0f, Noise, saturate(InJitterAmount)), 0.05f, 1.0f);
+    const float RaySeed = GG_RaySeed(InPixelPos);
+    const float JitterAmount = saturate(InJitterAmount);
 
 	// -- March --------------------------------------------------------------
 
@@ -1330,10 +1412,6 @@ float4 GG_March(
         const float T01 = saturate((T - TStart) * InvSpan);
 
         float StepLen = BaseStep * (1.0f + Growth * T01);
-        if (i == 0)
-        {
-            StepLen *= FirstScale;
-        }
         StepLen = min(StepLen, Remaining);
 
         StepsTaken += 1.0f;
@@ -1341,7 +1419,12 @@ float4 GG_March(
 		// Midpoint sample. With steps that grow, sampling at the near edge
 		// weights every interval by its own leading face and biases the
 		// integral toward the camera.
-        const float3 SamplePos = Origin + Dir * (T + StepLen * 0.5f);
+		// Sampled at the step centre plus a jittered offset within the step, so
+		// the sample stays inside the interval it represents -- stratified,
+		// unbiased, and off the lattice.
+        const float Offset = GG_StepJitter(RaySeed, i) * StepLen * JitterAmount;
+
+        const float3 SamplePos = Origin + Dir * (T + StepLen * 0.5f + Offset);
 
 		// How much ALTITUDE this step spans, which is the step length projected
 		// onto the radius. A grazing ray covers almost none of it however long
@@ -1361,8 +1444,8 @@ float4 GG_March(
 			FlowField, FlowSampler, PackedDetail, PackedSampler,
 			SamplePos, PlanetRadius,
 			Time, RigidRate, Scales, Warps, Detail, Layers,
-			BandSharpness, ReliefThinning, DetailVertical, DetailErosion, DetailDepth,
-			StepHalfHeight, DensityCurve, Relief, Profile);
+			BandSharpness, ReliefThinning, DetailVertical, DetailErosion, DetailRelief,
+			DetailDepth, StepHalfHeight, DensityCurve, Relief, Profile);
 
 		// No extinction multiplier. Density is already absolute -- CoreDensity is
 		// the density the deck reaches, in world units -- so a separate scale
