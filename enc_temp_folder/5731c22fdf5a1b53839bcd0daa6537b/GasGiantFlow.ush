@@ -61,21 +61,15 @@
 //
 //                SAMPLER: WRAP ON U, CLAMP ON V. The grid is a cylinder.
 //
-//   PackedDetail Four independent scalars, BGRA8. The ONLY baked volume left.
+//   DetailFlow   Gradient + INDEPENDENT alpha, RGBA16F. A is best spent on
+//                Worley F2-F1, whose cell walls give the filament network
+//                directly. The C0 warning on F2-F1 does not apply because this
+//                channel is read, never differentiated.
 //
-//                  R  Perlin        )  combined as Perlin-Worley, the fluffy
-//                  G  Worley F1     )  cloud-shape term. G also gates towers.
-//                  B  Ridged        streaks, read raw so they stay wispy
-//                  A  Worley F2-F1  the filament network
+//   PackedDetail Four independent scalars, BGRA8. Chemistry riding on top of
+//                the flow rather than part of it, so it is held nearly rigid.
 //
-//                Sampled TWICE, at two positions: once carrying the flow warp
-//                so filaments stretch along it, once held nearly rigid so the
-//                chemistry stays round. Same texture, two behaviours.
-//
-//                The second volume is gone. It carried a baked gradient for
-//                the detail warp, and the warp now comes from the sim.
-//
-// THE VOLUME IS WRAP ON ALL THREE AXES.
+// THE TWO 3D VOLUMES ARE WRAP ON ALL THREE AXES.
 //
 /** Steps in the warp integration.
  *
@@ -321,12 +315,14 @@ float GG_CloudTop(
  *  Scales  float4(DetailScale, PackedScale, DetailWarpInherit, PackedWarpInherit)
  *  Warps   float4(WarpTime, DetailWarp, BandJitter, TurbulenceFloor)
  *  Detail  float4(Ridge, Mottle, Wisp, EdgeBias)
- *  Layers  float3(FlowLayer, DeepFlowLayer, unused)
+ *  Layers  float3(FlowLayer, DetailFlowLayer, unused)
  *
  *  Three fetches per evaluation, against eight before. */
 float4 GG_Field(
 	Texture2DArray FlowField,
 	SamplerState FlowSampler,
+	Texture3D DetailFlow,
+	SamplerState DetailSampler,
 	Texture3D PackedDetail,
 	SamplerState PackedSampler,
 	float3 P,
@@ -399,15 +395,7 @@ float4 GG_Field(
 	// That is also the right way round physically. Band boundaries are the
 	// jets, where the shear is; band interiors are quiescent. Material gets
 	// thinned where it is strained and accumulates where it is not.
-	// SMOOTH, NOT saturate(abs()). That form has a kink where it pins at one
-	// and another at the zero crossing, and both are C1 discontinuities in the
-	// cloud top -- creases running along band contours, which read as hard
-	// lines in the surface rather than as banding.
-	//
-	// 1 - exp(-Zeta^2) is C-infinity everywhere: quadratic near zero, so band
-	// boundaries are rounded valleys rather than V-shaped ones, and asymptotic
-	// to one, so band cores flatten without ever pinning.
-    const float Elevation = 1.0f - exp(-Zeta * Zeta);
+    const float Elevation = saturate(abs(Zeta));
 
 	// The boundary weight falls straight out of the elevation: a boundary is
 	// exactly where the elevation is lowest. One subtract, and it cannot drift
@@ -505,26 +493,14 @@ float4 GG_Field(
 	// looks pinned while the bands move over it, raise Warps.x rather than
 	// reintroducing a clock.
     const float3 DetailUVW = PDetail * (Scales.x + Height * DetailVertical);
-    const float4 DetailSample = PackedDetail.SampleLevel(PackedSampler, DetailUVW, 0.0f);
+    const float4 DetailSample = DetailFlow.SampleLevel(DetailSampler, DetailUVW, 0.0f);
 
     DetailWarp = GG_FlowVelocity(PDetail, DeepFlow) * (Warps.y * Turbulence);
     Pos = normalize(Warped + DetailWarp);
 
-	// Alpha carries Worley F2-F1, the filament network. Minimal ON cell walls,
-	// so it arrives dark and reads as bright wisps once weighted.
-	//
-	// SAME VOLUME AS THE PACKED SAMPLE BELOW, read at a DIFFERENT POSITION.
-	//
-	// The second baked volume is gone. It used to carry a gradient field for
-	// this warp, and the warp now comes from the sim -- so all that survived of
-	// it was one alpha channel in an RGBA16F volume, which is four times the
-	// storage for a quarter of the use.
-	//
-	// The two positions are still worth keeping apart, and that is why this is
-	// a separate fetch rather than a swizzle of the one below. PDetail inherits
-	// the flow warp at Scales.z, so filaments stretch along the flow; PPacked
-	// inherits almost none of it, so the chemistry stays round. Same texture,
-	// two behaviours.
+	// The independent alpha. Worley F2-F1 is MINIMAL on cell walls, so the
+	// filament network arrives dark and Ridge usually wants to be negative to
+	// make it read as bright wisps.
     Ridge = DetailSample.a;
 #endif
 
@@ -715,20 +691,13 @@ float GG_Spot(float3 N, float3 Centre, float Radius, float Strength)
  *  thin enough that sampling at the true radius would shift UVW by far less
  *  than one lattice cell, so it would cost the same and change nothing.
  *
- *  Profile is float4(ShellThickness, TopSoftness, VortexThreshold, CoreDensity).
- *
- *  StepHalfLength is half the march step, expressed in SHELL FRACTIONS along
- *  the radius -- the amount of altitude this sample is responsible for. The
- *  envelope is integrated across it so a step straddling the cloud top is
- *  weighted by how much of it lies inside, rather than counted or discarded
- *  whole.
+ *  Profile is float4(ShellThickness, TopSoftness, VortexThreshold, CoreRadius).
  *
  *  Returns:
  *    x  Density in [0,1]. Multiply by an extinction coefficient in the march.
  *    y  BAND MASK, for the colour ramp. NOT a density term.
  *    z  Pressure, for tinting vortices.
- *    w  This sample's own altitude, as a shell fraction. Integrated against
- *       density in the march, it becomes the mean altitude the ray saw.
+ *    w  Cloud top altitude, for shading relief and sphere-tracing the surface.
  *
  *  Note the march wants BandSharpness low -- around 0.8. High sharpness
  *  saturates Band toward 0 and 1, which turns the height field into two flat
@@ -738,6 +707,8 @@ float GG_Spot(float3 N, float3 Centre, float Radius, float Strength)
 float4 GG_Density(
 	Texture2DArray FlowField,
 	SamplerState FlowSampler,
+	Texture3D DetailFlow,
+	SamplerState DetailSampler,
 	Texture3D PackedDetail,
 	SamplerState PackedSampler,
 	float3 LocalPos,
@@ -752,8 +723,6 @@ float4 GG_Density(
 	float ReliefThinning,
 	float DetailVertical,
 	float DetailErosion,
-	float DetailDepth,
-	float StepHalfLength,
 	float4 Relief,
 	float4 Profile)
 {
@@ -764,7 +733,7 @@ float4 GG_Density(
     const float Height = (Radius - PlanetRadius) / max(Profile.x, 1e-4f);
 
     const float4 Field = GG_Field(
-		FlowField, FlowSampler, PackedDetail, PackedSampler,
+		FlowField, FlowSampler, DetailFlow, DetailSampler, PackedDetail, PackedSampler,
 		Direction, Time, RigidRate, Scales, Warps, Detail, Layers,
 		Height, BandSharpness, ReliefThinning, DetailVertical, Relief, Profile.z);
 
@@ -793,108 +762,37 @@ float4 GG_Density(
 	// bite within the softness band. That is a rough surface on an opaque
 	// shell, not cloud -- there was no vertical structure anywhere the envelope
 	// was saturated, which is most of it.
-	// THE ENVELOPE IS INTEGRATED ACROSS THE STEP, NOT SAMPLED AT ITS MIDPOINT.
-	//
-	// One midpoint sample makes the deck a binary decision per step: a step
-	// whose centre lands above Top contributes nothing and one just below
-	// contributes fully, so a step straddling the surface is counted or
-	// discarded whole. As the surface drifts against the step lattice that
-	// flips, and the flip locus is a line on screen -- another artifact of the
-	// sampling rather than of the field.
-	//
-	// The deck top varies slowly across one step, so Top is evaluated once at
-	// the centre and only the ENVELOPE is integrated. That costs two extra
-	// smoothsteps and no extra fetches, which is the whole reason it is worth
-	// doing here rather than by taking more steps.
-	//
-	// Simpson over the step: exact for the cubic that smoothstep already is,
-	// wherever the step lies entirely inside the transition.
-    const float HalfStep = max(StepHalfLength, 0.0f);
+    const float Envelope = 1.0f - smoothstep(Top - Softness, Top, Height);
 
-    const float EnvNear = 1.0f - smoothstep(Top - Softness, Top, Height - HalfStep);
-    const float EnvMid = 1.0f - smoothstep(Top - Softness, Top, Height);
-    const float EnvFar = 1.0f - smoothstep(Top - Softness, Top, Height + HalfStep);
-
-    const float Envelope = (EnvNear + 4.0f * EnvMid + EnvFar) / 6.0f;
-
-	// THE CARVE FADES WITH DEPTH, WHICH IS WHAT MAKES IT A SKIN.
+	// DetailErosion mixes between the bare envelope and the envelope shaped by
+	// the noise. At 0 the deck is smooth; at 1 the noise decides the density
+	// everywhere within it.
 	//
-	// Depth below the cloud top, in shell fractions. Zero at the surface,
-	// growing inward.
-    const float Depth = Top - Height;
-
-	// Full erosion at the surface, none below DetailDepth. Without this the
-	// noise carves equally at every depth, so the core never overcomes it and
-	// the deck is uniformly pitted rather than being solid material with a
-	// worked surface -- the carve then has no silhouette to cut into, because
-	// there is no depth at which the cloud is reliably opaque.
+	// THE LERP FORM GIVES A DENSITY FLOOR OF (1 - DetailErosion), AND THAT IS
+	// LOAD-BEARING HERE.
 	//
-	// Smoothstep rather than a linear ramp: the point where erosion stops is a
-	// density discontinuity in the depth direction, and a linear falloff leaves
-	// it C0. That shows up edge-on as a faint shelf at a constant altitude,
-	// which reads as a rendering artifact because it is one.
-    const float CarveWeight = 1.0f - smoothstep(0.0f, max(DetailDepth, 1e-4f), Depth);
-
-	// DetailErosion is how hard the noise cuts at the surface; DetailDepth is
-	// how far in it reaches. Together they are the thickness and roughness of
-	// the worked shell, and they are separate because a deep gentle carve and a
-	// shallow violent one look nothing alike.
+	// There is no lower cloud shell. The deck is solid all the way down to the
+	// backstop, and the ray is expected to terminate on TRANSMITTANCE long
+	// before it reaches that radius. So the noise must never be able to open a
+	// fully transparent column: it would let a ray run to the backstop, which
+	// terminates opaque, and the result is a hard-edged hole punched through
+	// the planet rather than a gap in the cloud.
 	//
-	// THE FLOOR IS STILL (1 - DetailErosion) AT THE SURFACE, AND ONE DEEPER.
-	// There is no lower cloud shell, so a fully transparent column would let a
-	// ray reach the backstop, which terminates opaque -- a hard-edged hole
-	// punched through the planet rather than a gap in the cloud. The lerp
-	// cannot produce one; a multiply by the noise could.
+	// A multiply by the noise would allow exactly that. The lerp cannot,
+	// whatever the noise does, as long as DetailErosion stays below 1. Keep it
+	// there, and set DensityScale high enough that the floor saturates within a
+	// few steps -- coverage is total, so the march should go opaque quickly and
+	// spend its budget resolving the cloud TOP rather than the interior.
 	//
 	// Still strictly multiplicative against the envelope, which is what keeps
 	// the marched span analytically thin: the envelope is exactly zero above
 	// Top, so nothing the noise does can put density outside the bound
-	// GG_TopBounds computed.
-	// DENSITY RISES WITH DEPTH, AND THAT IS WHAT MAKES THE BACKSTOP INVISIBLE.
-	//
-	// The envelope saturates at 1 below the fade, so without this the deck has
-	// a flat density all the way down and the optical depth to the inner
-	// backstop is just DensityScale times that constant times the depth. At any
-	// density low enough for the surface carve to be visible, rays reach the
-	// backstop -- which terminates OPAQUE, as a step function, so its
-	// silhouette appears as a hard edge cutting across the shell. It reads as a
-	// clipping plane because that is effectively what it is.
-	//
-	// Real decks compress under their own weight, so a deck that gets denser
-	// with depth is the physical answer as well as the practical one. It also
-	// gives the core something to overcome the carve WITH: the erosion fades
-	// out over DetailDepth while the density climbs, so the two cross and the
-	// worked skin sits on material that is unambiguously solid.
-	//
-	// Profile.w is the multiplier gained per unit of shell depth. It took the
-	// slot the core radius used to occupy, which is free now that there is no
-	// inner sphere -- and it belongs with the rest of the vertical profile.
-	// Linear
-	// rather than exponential: exponential buries the crossover under the
-	// surface at almost any setting, and linear is already enough to put the
-	// backstop out of reach.
-    const float DepthGain = 1.0f + max(Depth, 0.0f) * max(Profile.w, 0.0f);
+	// GG_TopBounds computed. An additive term could, and would be clipped by
+	// the very bound that makes the march affordable.
+    const float Density = Envelope * lerp(1.0f, Field.w, saturate(DetailErosion));
 
-    const float Density = Envelope * DepthGain
-		* lerp(1.0f, Field.w, saturate(DetailErosion) * CarveWeight);
-
-	// W IS THIS SAMPLE'S OWN ALTITUDE, NOT THE DECK TOP.
-	//
-	// This is what makes the 3D detail visible at all, and the distinction is
-	// easy to miss. Top is constant down a column: it comes from the flow, and
-	// the flow is columnar. So integrating Top along the ray returns Top
-	// exactly, whatever the density did on the way -- and the detail, which
-	// only affects density, could never reach the image through it.
-	//
-	// Integrating the SAMPLE HEIGHT weighted by density gives the mean altitude
-	// of what the ray actually saw. Where the noise has eroded the deck the ray
-	// penetrates further before saturating, so that mean drops. The 3D
-	// structure becomes surface relief without ever displacing a surface, which
-	// is the only way a heightfield and a volume can both be honoured: a
-	// displacement needs one value per column, and a volume does not have one.
-	//
 	// Field.z is the signed band, which is what the colour follows.
-    return float4(Density, Field.z, Field.y, Height);
+    return float4(Density, Field.z, Field.y, Top);
 }
 
 // ---------------------------------------------------------------------------
@@ -1056,6 +954,8 @@ void GG_TopBounds(float4 Relief, out float OutMin, out float OutMax)
 float4 GG_March(
 	Texture2DArray FlowField,
 	SamplerState FlowSampler,
+	Texture3D DetailFlow,
+	SamplerState DetailSampler,
 	Texture3D PackedDetail,
 	SamplerState PackedSampler,
 	float3 InViewVec,
@@ -1071,7 +971,6 @@ float4 GG_March(
 	float ReliefThinning,
 	float DetailVertical,
 	float DetailErosion,
-	float DetailDepth,
 	float4 Relief,
 	float4 Profile,
 	float InDensityScale,
@@ -1096,37 +995,20 @@ float4 GG_March(
     float TopMin, TopMax;
     GG_TopBounds(Relief, TopMin, TopMax);
 
-	// THE ONLY SPHERE, AND IT IS A CULL, NOT A BOUNDARY.
-	//
-	// Density is exactly zero above Top, and Top can never exceed TopMax, so
-	// everything outside this radius is provably empty. The sphere exists to
-	// avoid marching that emptiness and for no other reason -- nothing is
-	// clipped by it and nothing terminates on it.
-	//
-	// A softness of margin on top. Not needed for correctness, but it puts the
-	// ray's first sample clear of the density boundary rather than exactly on
-	// it, so the march has a run-up and the entry point stops coinciding with
-	// the one place the field is discontinuous in its derivative.
-    const float OuterRadius = PlanetRadius + Thickness * (TopMax + Softness);
+	// No margin above TopMax. Density is saturate((Top - Height)/Softness),
+	// which is exactly zero at Height == Top, so there is provably nothing
+	// there and padding it would only buy empty steps.
+    const float OuterRadius = PlanetRadius + Thickness * TopMax;
 
-	// THERE IS NO INNER BOUND. THE DECK HAS A TOP AND NOTHING ELSE.
+	// Below this the field is saturated everywhere, so the ray can never see
+	// past it. It is the backstop, not a surface.
 	//
-	// A terrestrial cloud shader has a band with an inner and an outer radius,
-	// and clipping the march against both is right there. This deck is not a
-	// band: it is solid from its top all the way down, getting denser, and the
-	// only thing that ends a ray is running out of transmittance.
-	//
-	// The inner sphere was carried over from that shader and every problem it
-	// caused was the same problem in a different form. Forcing opacity on
-	// contact made its silhouette a hard edge. Clipping the span without
-	// forcing opacity made the STEP SIZE jump at the same silhouette, because
-	// the step was span-relative. Both drew a line along a sphere that has no
-	// business existing here.
-	//
-	// Rays heading inward need no help terminating. Height falls to
-	// -PlanetRadius/Thickness at the centre -- tens of shell depths -- so
-	// DepthGain reaches the hundreds and a single step saturates. The early-out
-	// on transmittance handles it, which is what it is for.
+	// Profile.w overrides it when positive, which is what you want once a solid
+	// core mesh is drawn inside: shrink this to sit just outside that mesh and
+	// the atmosphere stops where the surface begins, instead of at whatever
+	// radius the deck bound happened to imply.
+    const float DerivedInner = PlanetRadius + Thickness * max(TopMin - Softness, 0.0f);
+    const float InnerRadius = (Profile.w > 0.0f) ? Profile.w : DerivedInner;
 
     float TEnter, TExit;
     if (!GG_RaySphere(Origin, Dir, OuterRadius, TEnter, TExit))
@@ -1140,8 +1022,32 @@ float4 GG_March(
     }
 
 	// Camera inside the shell falls out of this clamp rather than needing its
-	// own branch.
+	// own branch, and it matters under a span-relative step rule: the stretch
+	// behind the viewer would otherwise be budgeted as if visible, spending
+	// steps on nothing AND coarsening everything that is not.
     float TStart = max(TEnter, 0.0f);
+
+	// Clip against the opaque interior. Anything past the near intersection is
+	// fully dense by construction, so marching it would burn steps to confirm
+	// what the bound already guarantees.
+	//
+	// Hitting it must also terminate the ray OPAQUE. Clipping the span without
+	// zeroing transmittance is what produced a hard ring where grazing rays ran
+	// out of march before they ran out of medium -- the geometry stopped but the
+	// opacity did not, so the shell appeared to thin out against a boundary that
+	// is physically solid. Anything at or below this radius is saturated by
+	// construction, so the ray genuinely cannot see past it.
+    bool bHitCore = false;
+
+    float TInner0, TInner1;
+    if (GG_RaySphere(Origin, Dir, InnerRadius, TInner0, TInner1))
+    {
+        if (TInner0 > TStart)
+        {
+            TExit = min(TExit, TInner0);
+            bHitCore = true;
+        }
+    }
 
     if (TExit <= TStart)
     {
@@ -1151,45 +1057,22 @@ float4 GG_March(
 	// -- Step sizing --------------------------------------------------------
 
     const float Span = max(TExit - TStart, 1e-6f);
-	// STEP SIZE FROM A FIXED REFERENCE, NOT FROM THIS RAY'S SPAN.
-	//
-	// It used to be Span / StepBudget, and the span is clipped by the inner
-	// bound -- so it changes discontinuously at that sphere's tangent, and the
-	// step size changed with it. A step-size jump in an integral this sparse
-	// does not average out: it shows as a clean line along the silhouette of a
-	// sphere that is supposed to be invisible.
-	//
-	// The reference is the deck's own total vertical extent, identical for
-	// every ray. StepBudget therefore means steps across the DECK rather than
-	// steps across whatever this ray happened to be clipped to, which is also
-	// the more useful reading -- the deck is the thing being resolved, and how
-	// much empty shell a ray crossed first should not change how finely it is
-	// sampled.
-    const float ReferenceSpan = max(Thickness * (TopMax - TopMin + Softness), 1e-6f);
+    const float BaseStep = Span / max(InStepBudget, 1.0f);
 
-    const float BaseStep = ReferenceSpan / max(InStepBudget, 1.0f);
-
-	// NO STEP FLOOR.
+	// Step floor from the field rather than an authored distance. The finest
+	// structure along the ray is the deck's own transition width, since nothing
+	// resolves more finely than the softness over which density goes from zero
+	// to one. Half of that is the Nyquist limit and stepping below it resolves
+	// detail the field does not contain.
 	//
-	// There used to be one, to stop the march resolving finer than the field's
-	// own finest feature. It was a guard against a span-relative BaseStep going
-	// arbitrarily small on a short span -- and BaseStep is now derived from a
-	// fixed reference, so it cannot.
-	//
-	// What the floor did instead was introduce a max(), and a max() is a C1
-	// discontinuity wherever its two arguments cross. Because the crossing
-	// happens at a fixed distance along the ray, and every ray starts at the
-	// camera, that locus is a SPHERE AROUND THE VIEWER -- which draws a curve
-	// across the image that moves with the camera and belongs to nothing in the
-	// field. With BaseStep and the old floor landing within a few percent of
-	// each other at typical settings, the crossing sat near the ray start,
-	// where the weights are largest and it shows most.
-	//
-	// StepBudget is the only control on step size now, which is the honest
-	// arrangement: one number, no branch, no locus.
+	// This is the vertical limit. Horizontal detail is set by the texture
+	// scales and matters only at the limb, where the ray runs nearly tangent
+	// and crosses many columns per step -- which is also where step growth
+	// hurts most, so keep growth modest if the terminator looks banded.
+    const float MinStep = max(Thickness * Softness * 0.5f, 1e-5f);
 
     const float Growth = max(InStepGrowth, 0.0f);
-    const float InvSpan = 1.0f / ReferenceSpan;
+    const float InvSpan = 1.0f / Span;
 
 	// Shortens the first step only, offsetting each pixel's lattice so the
 	// sampling grid does not read as banding. Costs no energy: the final step
@@ -1206,27 +1089,6 @@ float4 GG_March(
     float Emission = 0.0f;
     float BandAccum = 0.0f;
     float Pressure = 0.0f;
-
-	// SURFACE ALTITUDE AS AN OPACITY-WEIGHTED MEAN.
-	//
-	// Every ray that accumulates anything has one, and it varies continuously
-	// with everything that feeds it. That is the property that matters here.
-	//
-	// It was briefly a transmittance CROSSING instead -- interpolate where
-	// opacity passes a half -- which is sharper for rays that reach it and
-	// undefined for rays that do not. The fallback for those was the exit
-	// altitude on the far side of the cull sphere, unrelated to the deck, so
-	// rays that just barely saturated reported a height inside the cloud and
-	// rays that just barely did not reported somewhere else entirely. The
-	// boundary between the two populations is the set of rays whose total
-	// optical depth is ln(2), and that locus traces the deck's silhouette --
-	// drawing a line along the surface it was measuring.
-	//
-	// The crossing existed to fix per-pixel noise in this value, which came
-	// from rays saturating inside a single step. That had a different cause and
-	// has its own fix: the step floor is gone and BaseStep is derived from a
-	// fixed reference, so several samples now land inside the skin and the mean
-	// is stable without needing to be sharp.
     float TopAccum = 0.0f;
 
     float T = TStart;
@@ -1241,11 +1103,11 @@ float4 GG_March(
             break;
         }
 
-		// Growth runs on distance travelled against the same fixed reference,
-		// so it carries no span dependence either.
+		// Growth runs on progress along the span, not distance from the camera,
+		// which keeps the step count independent of where the viewer stands.
         const float T01 = saturate((T - TStart) * InvSpan);
 
-        float StepLen = BaseStep * (1.0f + Growth * T01);
+        float StepLen = max(BaseStep * (1.0f + Growth * T01), MinStep);
         if (i == 0)
         {
             StepLen *= FirstScale;
@@ -1259,21 +1121,12 @@ float4 GG_March(
 		// integral toward the camera.
         const float3 SamplePos = Origin + Dir * (T + StepLen * 0.5f);
 
-		// How much ALTITUDE this step spans, which is the step length projected
-		// onto the radius. A grazing ray covers almost none of it however long
-		// the step is, so using the step length directly would smear the deck
-		// across the whole limb.
-        const float3 SampleDir = SamplePos * rsqrt(max(dot(SamplePos, SamplePos), 1e-8f));
-
-        const float StepHalfHeight =
-			abs(dot(Dir, SampleDir)) * StepLen * 0.5f / max(Profile.x, 1e-4f);
-
         const float4 Field = GG_Density(
-			FlowField, FlowSampler, PackedDetail, PackedSampler,
+			FlowField, FlowSampler, DetailFlow, DetailSampler, PackedDetail, PackedSampler,
 			SamplePos, PlanetRadius,
 			Time, RigidRate, Scales, Warps, Detail, Layers,
-			BandSharpness, ReliefThinning, DetailVertical, DetailErosion, DetailDepth,
-			StepHalfHeight, Relief, Profile);
+			BandSharpness, ReliefThinning, DetailVertical, DetailErosion,
+			Relief, Profile);
 
         const float Alpha = 1.0f - exp(-Field.x * InDensityScale * StepLen);
         const float Weight = Alpha * Transmittance;
@@ -1281,7 +1134,6 @@ float4 GG_March(
         Emission += Weight;
         BandAccum += Weight * Field.y;
         Pressure += Weight * Field.z;
-
         TopAccum += Weight * Field.w;
 
         Transmittance *= 1.0f - Alpha;
@@ -1298,12 +1150,15 @@ float4 GG_March(
 	// they stay in their own units instead of scaling with opacity. Guarded
 	// because a ray that grazed the shell without accumulating anything has
 	// nothing to report and must not divide by zero.
+	// The march stopped against the solid interior, so nothing gets through.
+    if (bHitCore)
+    {
+        Emission += Transmittance;
+        Transmittance = 0.0f;
+    }
 
     const float TotalWeight = max(Emission, 1e-4f);
 
-	// Normalized by the weight that produced it, so it stays an altitude rather
-	// than scaling with opacity. A ray that gathered nothing divides by the
-	// guard and reports zero, which is correct: it saw no surface.
     float TopOut = TopAccum / TotalWeight;
 
 #if GG_DEBUG_STEPS

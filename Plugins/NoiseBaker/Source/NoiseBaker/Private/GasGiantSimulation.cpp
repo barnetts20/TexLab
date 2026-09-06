@@ -24,6 +24,7 @@ struct FGasGiantSimResources
 	FRDGTextureRef Vorticity[2] = { nullptr, nullptr };
 	FRDGTextureRef Psi = nullptr;
 	FRDGTextureRef RowMean = nullptr;
+	FRDGTextureRef PsiRowMean = nullptr;
 	FRDGTextureRef GlobalMean = nullptr;
 	FRDGTextureRef Velocity = nullptr;
 	FRDGTextureRef Debug = nullptr;
@@ -162,6 +163,7 @@ void FGasGiantSimulation::Release_RenderThread()
 	// The payload is owned by the initialisation branch in Enqueue, which
 	// either consumes it or reports it as mismatched and empties it there.
 	PooledRowMean.SafeRelease();
+	PooledPsiRowMean.SafeRelease();
 	PooledGlobalMean.SafeRelease();
 
 	AllocatedGrid = FIntVector::ZeroValue;
@@ -202,6 +204,7 @@ bool FGasGiantSimulation::EnsureResources(const FGasGiantSimParams& Params)
 			TexCreate_ShaderResource | TexCreate_UAV);
 
 		PooledRowMean = AllocatePooledTexture(RowDesc, TEXT("GasGiant.RowMean"));
+		PooledPsiRowMean = AllocatePooledTexture(RowDesc, TEXT("GasGiant.PsiRowMean"));
 
 		const FRDGTextureDesc GlobalDesc = FRDGTextureDesc::Create2D(
 			FIntPoint(1, Slices), PF_R32_FLOAT, FClearValueBinding::Black,
@@ -369,6 +372,17 @@ void FGasGiantSimulation::AddSubstep(FRDGBuilder& GraphBuilder, const FGasGiantS
 		FGasGiantSimParameters* P = GraphBuilder.AllocParameters<FGasGiantSimParameters>();
 		FillCommonParameters(*P, Params);
 		P->SimPsiSRV = GraphBuilder.CreateSRV(R.Psi);
+		P->SimPsiRowMeanUAV = GraphBuilder.CreateUAV(R.PsiRowMean);
+
+		AddSimPass<FGasGiantReducePsiRowsCS>(GraphBuilder, TEXT("GasGiant.ReducePsiRows"), P, GroupsRows);
+	}
+
+	{
+		FGasGiantSimParameters* P = GraphBuilder.AllocParameters<FGasGiantSimParameters>();
+		FillCommonParameters(*P, Params);
+		P->SimPsiSRV = GraphBuilder.CreateSRV(R.Psi);
+		P->SimVorticitySRV = GraphBuilder.CreateSRV(R.Source());
+		P->SimPsiRowMeanSRV = GraphBuilder.CreateSRV(R.PsiRowMean);
 		P->SimVelocityUAV = GraphBuilder.CreateUAV(R.Velocity);
 
 		AddSimPass<FGasGiantVelocityCS>(GraphBuilder, TEXT("GasGiant.Velocity"), P, Groups2D);
@@ -488,6 +502,7 @@ void FGasGiantSimulation::Enqueue_RenderThread(FRDGBuilder& GraphBuilder, const 
 	R.Vorticity[1] = GraphBuilder.RegisterExternalTexture(PooledVorticity[1]);
 	R.Psi = GraphBuilder.RegisterExternalTexture(PooledPsi);
 	R.RowMean = GraphBuilder.RegisterExternalTexture(PooledRowMean);
+	R.PsiRowMean = GraphBuilder.RegisterExternalTexture(PooledPsiRowMean);
 	R.GlobalMean = GraphBuilder.RegisterExternalTexture(PooledGlobalMean);
 	R.Current = CurrentVorticity;
 
@@ -558,9 +573,21 @@ void FGasGiantSimulation::Enqueue_RenderThread(FRDGBuilder& GraphBuilder, const 
 	// dispatch; without it the flow the material sees is always one substep
 	// stale, which is invisible at four substeps a frame and confusing at one.
 	{
+		const FIntVector GroupsRows(
+			FMath::DivideAndRoundUp(Params.GridSize.Y, ThreadGroupSize1D), Params.GridSize.Z, 1);
+
+		FGasGiantSimParameters* PR = GraphBuilder.AllocParameters<FGasGiantSimParameters>();
+		FillCommonParameters(*PR, Params);
+		PR->SimPsiSRV = GraphBuilder.CreateSRV(R.Psi);
+		PR->SimPsiRowMeanUAV = GraphBuilder.CreateUAV(R.PsiRowMean);
+
+		AddSimPass<FGasGiantReducePsiRowsCS>(GraphBuilder, TEXT("GasGiant.ReducePsiRowsFinal"), PR, GroupsRows);
+
 		FGasGiantSimParameters* P = GraphBuilder.AllocParameters<FGasGiantSimParameters>();
 		FillCommonParameters(*P, Params);
 		P->SimPsiSRV = GraphBuilder.CreateSRV(R.Psi);
+		P->SimVorticitySRV = GraphBuilder.CreateSRV(R.Source());
+		P->SimPsiRowMeanSRV = GraphBuilder.CreateSRV(R.PsiRowMean);
 		P->SimVelocityUAV = GraphBuilder.CreateUAV(R.Velocity);
 
 		AddSimPass<FGasGiantVelocityCS>(GraphBuilder, TEXT("GasGiant.VelocityFinal"), P, GroupCount2D(Params.GridSize));

@@ -79,6 +79,7 @@ private:
 	TRefCountPtr<IPooledRenderTarget> PooledVorticity[2];
 	TRefCountPtr<IPooledRenderTarget> PooledPsi;
 	TRefCountPtr<IPooledRenderTarget> PooledRowMean;
+	TRefCountPtr<IPooledRenderTarget> PooledPsiRowMean;
 	TRefCountPtr<IPooledRenderTarget> PooledGlobalMean;
 
 	/** Which of PooledVorticity holds the live field. */

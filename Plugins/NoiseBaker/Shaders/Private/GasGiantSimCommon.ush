@@ -97,27 +97,12 @@ float3 SimDirection(float Lon, float Mu)
     return float3(C * CosL, C * SinL, Mu);
 }
 
-/** Eastward unit tangent. Independent of latitude, and finite at the poles
- *  because it is expressed in longitude rather than as a normalized cross
- *  product with the axis. */
-float3 SimEast(float Lon)
-{
-    float SinL, CosL;
-    sincos(Lon, SinL, CosL);
-
-    return float3(-SinL, CosL, 0.0f);
-}
-
-/** Northward unit tangent, i.e. d(Direction)/d(latitude). */
-float3 SimNorth(float Lon, float Mu)
-{
-    const float C = sqrt(1.0f - Mu * Mu);
-
-    float SinL, CosL;
-    sincos(Lon, SinL, CosL);
-
-    return float3(-Mu * CosL, -Mu * SinL, C);
-}
+// NOTE: the trig-based tangent basis helpers that used to live here are gone.
+// SimTangentVelocity builds the same vectors from the direction with no trig,
+// and nothing else needed them once the velocity texture began storing east and
+// north COMPONENTS rather than a 3D vector. Leaving them would have been a
+// second way to build the same basis, which is the shape of mistake that put
+// the streamfunction into the advection in the first place.
 
 /** Continuous grid coordinates from a unit direction. The inverse of
  *  SimDirection, in texel-index space so that integer values land on centres.
@@ -374,6 +359,30 @@ float SimLaplacian(Texture2DArray<float> Field, int2 C, uint Layer, out float Ou
 // and a second entry point that differenced the raw one would be an easy
 // mistake to make and a hard one to see -- it would work everywhere except
 // within a few degrees of the poles.
+
+/** Rebuilds a 3D tangent velocity from its stored east/north components.
+ *
+ *  The velocity texture stores TWO components, not three, because a tangent
+ *  vector on a sphere has two degrees of freedom and the freed channel is worth
+ *  more elsewhere. Anything reading that texture has to reconstruct, and this
+ *  is the one place that knows how.
+ *
+ *  NO TRIG. With c = length(N.xy) the basis is east = (-N.y, N.x, 0)/c and
+ *  north = (-N.z*N.x/c, -N.z*N.y/c, c), which are the vectors sincos(longitude)
+ *  would give, obtained from N directly.
+ *
+ *  Identical to GG_FlowVelocity in the material. The two must agree, because
+ *  the sim advects along this and the material warps along it -- a mismatch
+ *  would put the clouds on a different flow from the one that made them. */
+float3 SimTangentVelocity(float3 N, float2 Components)
+{
+    const float C = max(length(N.xy), 1e-5f);
+
+    const float3 East = float3(-N.y, N.x, 0.0f) / C;
+    const float3 North = float3(-N.z * N.x / C, -N.z * N.y / C, C);
+
+    return East * Components.x + North * Components.y;
+}
 
 /** Half-width, in texels, of the longitudinal box filter at this latitude.
  *

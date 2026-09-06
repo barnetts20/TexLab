@@ -121,6 +121,23 @@ RWTexture2DArray<float4> SimVelocityUAV;
 Texture2D<float> SimRowMeanSRV;
 RWTexture2D<float> SimRowMeanUAV;
 
+/** Zonal mean of the streamfunction, (row, layer).
+ *
+ *  EXISTS SO THAT ALPHA CAN CARRY THE EDDY FIELD RATHER THAN RAW PSI.
+ *
+ *  Psi for the mean flow is a large, smooth function of latitude -- it is the
+ *  integral of the jet profile -- and it swamps the eddy part completely. A
+ *  material reading raw psi as "pressure" therefore gets a latitude ramp with
+ *  the storms buried in it, so lifting cloud tops by it raises whole bands
+ *  instead of raising vortices, and tinting by it tints hemispheres.
+ *
+ *  Subtracting the row mean leaves exactly the departure from zonal symmetry:
+ *  zero in undisturbed flow, positive in anticyclones, negative in cyclones.
+ *  That is what pressure has to mean for GG_CloudTop's lift and for band
+ *  deflection to land on the features rather than near them. */
+Texture2D<float> SimPsiRowMeanSRV;
+RWTexture2D<float> SimPsiRowMeanUAV;
+
 /** Area mean of vorticity over the whole sphere, (0, layer). */
 Texture2D<float> SimGlobalMeanSRV;
 RWTexture2D<float> SimGlobalMeanUAV;
@@ -364,27 +381,36 @@ void MainInitVorticityCS(uint3 Id : SV_DispatchThreadID)
 // Velocity, and the texture the material reads
 // ---------------------------------------------------------------------------
 
-/** Writes float4(velocity.xyz, psi).
+/** Writes float4(u_east, u_north, psi_eddy, zeta_normalized).
  *
- *  VELOCITY IN RGB RATHER THAN A GRADIENT TO BE CROSSED WITH THE NORMAL.
+ *  TANGENT COMPONENTS RATHER THAN A 3D VECTOR, WHICH BUYS A CHANNEL.
  *
- *  The material used to read a baked grad(psi), project it tangentially, cross
- *  it with N and multiply by a hand-calibrated constant to convert a normalized
- *  [-1,1] channel into an angular rate. All four of those steps disappear. The
- *  sim knows the velocity in physical units, it is already tangent, and writing
- *  it directly means the unit conversion cannot be got wrong because it does not
- *  exist.
+ *  A tangent vector on a sphere has two degrees of freedom, not three, so
+ *  storing all three components wastes one. The material rebuilds the 3D vector
+ *  from the direction it already has, and the tangent basis needs no trig at
+ *  all -- with c = length(N.xy), east is (-N.y, N.x, 0)/c and north is
+ *  (-N.z*N.x/c, -N.z*N.y/c, c). About ten ALU against a whole channel.
  *
- *  PSI IN ALPHA IS THE PRESSURE CHANNEL. cross(N, grad psi) is the geostrophic
- *  relation, so the circulation around a high or a low is not decorated on
- *  afterwards -- psi and the velocity come from the same field, and vortex
- *  centres in alpha are exactly the places the RGB circulates around. That is
- *  what makes GG_CloudTop's pressure lift land on the actual storms.
+ *  The channel goes to VORTICITY, which is what the bands actually are.
+ *  Previously the material redrew bands analytically from latitude while the
+ *  sim maintained them in vorticity, and the two disagreed: zeta and the rate
+ *  profile do not share zero crossings, so the drawn bands sat off the flow
+ *  that was supposed to be making them. Sampling zeta directly removes the
+ *  second definition entirely -- and because the sim TRANSPORTS zeta, the bands
+ *  arrive already meandering, wrapped around vortices, with no warping needed
+ *  in the material to achieve it.
  *
- *  RGBA16F. Velocity components are O(JetStrength), psi is O(JetStrength), and
- *  half precision is roughly three decimal digits there -- far finer than the
- *  material's own filtering. Full float would double the bandwidth of the one
- *  resource that is read per pixel.
+ *  NORMALIZED HERE, NOT IN THE MATERIAL. Zeta scales with
+ *  JetStrength * BandCount, so a raw value would need both of those threaded
+ *  into the material purely to divide by them -- two parameters that must be
+ *  kept in sync with the sim by hand and do nothing else. Dividing here makes
+ *  the channel a signed band signal near [-1,1] and lets the material forget
+ *  the jet profile exists.
+ *
+ *  PSI IN Z IS THE EDDY FIELD, zonal mean removed. See SimPsiRowMeanSRV.
+ *
+ *  RGBA16F. Everything here is O(1) after normalization, and half precision is
+ *  roughly three decimal digits -- far finer than the material's filtering.
  *
  *  Dispatch (N_lon, N_lat, LayerCount). */
 [numthreads(8, 8, 1)]
@@ -431,9 +457,45 @@ void MainVelocityCS(uint3 Id : SV_DispatchThreadID)
     const float UEast = -CosPhi * ((North - South) / (2.0f * DMu));
     const float UNorth = ((East - West) / (2.0f * DLon)) / CosPhi;
 
-    const float3 Velocity = SimEast(Lon) * UEast + SimNorth(Lon, Mu) * UNorth;
+	// The zonal part removed, so z is the EDDY streamfunction. Applied only to
+	// the value written out -- the derivatives above use raw psi, because the
+	// row mean varies with latitude and subtracting it before differencing
+	// would corrupt the zonal velocity it is meant to leave alone.
+    const float PsiMean = SimPsiRowMeanSRV.Load(int3(C.y, Layer, 0));
 
-    SimVelocityUAV[int3(C, Layer)] = float4(Velocity, Psi);
+	// Zonal vorticity scale: the peak of |2 mu R - (1-mu^2) R'|, dominated by
+	// the R' term, which is what carries the band wavenumber. Per layer, so a
+	// layer running a weaker profile normalizes against its own contrast rather
+	// than the top deck's.
+    float BandCount, JetStrength, Boost, Asymmetry;
+    SimLayerJets(Layer, BandCount, JetStrength, Boost, Asymmetry);
+
+    const float ZetaScale = max(JetStrength * 0.6897f * BandCount * PI, 1e-4f);
+
+    const float Vorticity = SimLoad(SimVorticitySRV, C, Layer);
+
+	// Psi scale. Psi is velocity times length, so an eddy of speed ~JetStrength
+	// at the band scale ~1/(BandCount*pi) gives this. Approximate, which is
+	// fine: the soft saturation below is what actually bounds the channel.
+    const float PsiScale = max(JetStrength / max(BandCount * PI, 1e-3f), 1e-5f);
+
+    const float PsiNorm = (Psi - PsiMean) / PsiScale;
+
+	// SOFT SATURATION, so the channel is GUARANTEED to lie in [-1,1].
+	//
+	// Not cosmetic. The material bounds its raymarch span in closed form from
+	// Relief, and that bound assumes the pressure channel is bounded -- it used
+	// to be, when it was a decoded [0,1] baked channel. Raw eddy psi is not,
+	// so a strong vortex would push the cloud top above the computed outer
+	// radius and be clipped by the march. The symptom is a storm with its top
+	// sliced flat, which reads as a geometry bug rather than a bounds one.
+	//
+	// x / sqrt(1 + x^2) is linear near zero, asymptotes to +-1, and costs one
+	// rsqrt. Vortices compress rather than clip, which is also better looking
+	// than a hard clamp.
+    const float PsiSat = PsiNorm * rsqrt(1.0f + PsiNorm * PsiNorm);
+
+    SimVelocityUAV[int3(C, Layer)] = float4(UEast, UNorth, PsiSat, Vorticity / ZetaScale);
 }
 
 // ---------------------------------------------------------------------------
@@ -483,7 +545,17 @@ void MainAdvectCS(uint3 Id : SV_DispatchThreadID)
     const float Mu = SimRowToMu((float) C.y);
     const float3 N = SimDirection(Lon, Mu);
 
-    const float3 Velocity = SimVelocitySRV.Load(int4(C.x, C.y, Layer, 0)).xyz;
+	// RECONSTRUCTED, not read as .xyz.
+	//
+	// The velocity texture stores east/north COMPONENTS in xy, with psi and
+	// vorticity in zw. Reading .xyz treats the streamfunction as a third
+	// velocity component, which advects the field along a vector that is not
+	// tangent, not divergence-free, and not the flow -- so the sim collapses to
+	// a lopsided blob within a few hundred steps while every diagnostic still
+	// reports plausible numbers.
+    const float4 Flow = SimVelocitySRV.Load(int4(C.x, C.y, Layer, 0));
+
+    const float3 Velocity = SimTangentVelocity(N, Flow.xy);
 
     const float Speed = length(Velocity);
 
@@ -542,6 +614,35 @@ void MainReduceRowsCS(uint3 Id : SV_DispatchThreadID)
     }
 
     SimRowMeanUAV[int2(Row, Layer)] = Sum * SimInvGridSize.x;
+}
+
+/** Zonal mean of the streamfunction, one value per row.
+ *
+ *  Separate from MainReduceRowsCS because the two are needed at different
+ *  points in the step: the vorticity mean feeds the nudge, which runs after
+ *  advection, while this feeds the velocity pass, which runs before it.
+ *
+ *  Dispatch (N_lat, LayerCount, 1). */
+[numthreads(64, 1, 1)]
+void MainReducePsiRowsCS(uint3 Id : SV_DispatchThreadID)
+{
+    const int Row = (int) Id.x;
+    const uint Layer = Id.y;
+
+    if (Row >= SimGridSize.y || (int) Layer >= SimGridSize.z)
+    {
+        return;
+    }
+
+    float Sum = 0.0f;
+
+	[loop]
+    for (int I = 0; I < SimGridSize.x; I++)
+    {
+        Sum += SimPsiSRV.Load(int4(I, Row, Layer, 0));
+    }
+
+    SimPsiRowMeanUAV[int2(Row, Layer)] = Sum * SimInvGridSize.x;
 }
 
 /** Dispatch (LayerCount, 1, 1). */
@@ -1038,17 +1139,17 @@ void MainDebugVisCS(uint3 Id : SV_DispatchThreadID)
     else if (SimDebugMode == GG_DEBUG_SPEED)
     {
 		// Unsigned, so it is shown on the positive half of the ramp only.
-        Value = length(SimVelocitySRV.Load(int4(C.x, C.y, Layer, 0)).xyz);
+		// Components are already east and north, so the magnitude is a plain
+		// length of the pair -- no basis reconstruction needed.
+        Value = length(SimVelocitySRV.Load(int4(C.x, C.y, Layer, 0)).xy);
     }
     else if (SimDebugMode == GG_DEBUG_EAST)
     {
-        const float3 V = SimVelocitySRV.Load(int4(C.x, C.y, Layer, 0)).xyz;
-        Value = dot(V, SimEast(SimColumnToLon((float) C.x)));
+        Value = SimVelocitySRV.Load(int4(C.x, C.y, Layer, 0)).x;
     }
     else if (SimDebugMode == GG_DEBUG_NORTH)
     {
-        const float3 V = SimVelocitySRV.Load(int4(C.x, C.y, Layer, 0)).xyz;
-        Value = dot(V, SimNorth(SimColumnToLon((float) C.x), Mu));
+        Value = SimVelocitySRV.Load(int4(C.x, C.y, Layer, 0)).y;
     }
     else if (SimDebugMode == GG_DEBUG_RESIDUAL)
     {
