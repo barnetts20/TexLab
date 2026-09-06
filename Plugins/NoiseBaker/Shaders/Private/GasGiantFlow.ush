@@ -250,6 +250,55 @@ float3 GG_FlowVelocity(float3 N, float4 Flow)
     return East * Flow.x + North * Flow.y;
 }
 
+/** Density as a function of depth below the cloud top.
+ *
+ *  ONE CURVE, STARTING AT EXACTLY ZERO. That is the whole point of it.
+ *
+ *  This used to be two mechanisms: a smoothstep envelope climbing from 0 to 1
+ *  across a softness band, and then a linear gain ramping upward from a base of
+ *  1. The handover sat at an arbitrary altitude and started from an arbitrary
+ *  density, and both of those are visible -- density that arrives at the deck
+ *  top already finite draws a hard line there, and a deck whose fade completes
+ *  before the ramp begins has a shoulder in it.
+ *
+ *      rho(d) = Core * (1 - exp(-(d * Ramp)^(2/Curve)))
+ *
+ *  Ramp is an inverse depth: it moves the whole curve inward, so a larger value
+ *  reaches core density in less depth.
+ *
+ *  CURVE IS THE ONSET SHARPNESS, AND THE EXPONENT IS INVERTED FOR IT.
+ *
+ *  The natural reading of an exponent is backwards here. Raising the power on
+ *  (d*Ramp) makes it SMALLER near the top, because d*Ramp is below one there --
+ *  so a bigger exponent delays the onset and the deck goes more transparent at
+ *  its surface, which is the opposite of what a sharpness control should do.
+ *
+ *  Written as 2/Curve instead, so the parameter reads the way it should:
+ *
+ *      Curve 1    exponent 2, the default. Zero derivative at the top, so the
+ *                 onset is genuinely smooth and there is no crease.
+ *      Curve 2    exponent 1, a plain exponential. Finite slope meeting the
+ *                 zero outside, which is a C1 kink along the whole cloud top.
+ *      Curve 4    exponent 1/2. Infinite slope: a hard edge at the deck.
+ *      Curve 0.5  exponent 4. Very soft, the deck fades in over a long depth.
+ *
+ *  So higher is faster and sharper, lower is softer, and the crease that this
+ *  whole arrangement exists to avoid arrives at 2 and gets worse above it. That
+ *  is a real trade rather than a bug: a sharp cloud top IS a discontinuity, and
+ *  the parameter is where to make that choice deliberately. */
+float GG_DensityRamp(float Depth, float Ramp, float Curve, float Core)
+{
+    const float D = max(Depth, 0.0f) * max(Ramp, 0.0f);
+
+	// Inverted, so larger Curve means a smaller exponent and a faster onset.
+	// Clamped below because a non-positive exponent makes pow(0, k) return one,
+	// which would put full core density above the deck.
+    const float Exponent = 2.0f / max(Curve, 0.05f);
+
+    return Core * (1.0f - exp(-pow(D, Exponent)));
+}
+
+
 /** Cloud top altitude, as a fraction of the shell thickness.
  *
  *  THE DECK, AND NOTHING BUT THE DECK. Built entirely from the simulated flow:
@@ -628,6 +677,69 @@ float4 GG_Field(
     return float4(Top, Pressure, BandSigned, Shape);
 }
 
+/** Surface normal from the marched cloud-top altitude, using screen
+ *  derivatives.
+ *
+ *  THE NAIVE FORM IS WRONG ON A SPHERE. Treating ddx and ddy of the height as a
+ *  tangent-space gradient assumes the screen basis is orthonormal and aligned
+ *  with the surface, and it is neither: it is whatever the projection and the
+ *  local curvature make it, so the resulting normal tilts with the camera and
+ *  stretches toward the limb.
+ *
+ *  The correct construction inverts the screen-to-surface Jacobian. With dpx
+ *  and dpy the world position derivatives and N the sphere normal,
+ *
+ *      r1 = cross(dpy, N)      r2 = cross(N, dpx)      det = dot(dpx, r1)
+ *
+ *  gives a basis in which (r1*dhx + r2*dhy)/det is the true surface gradient of
+ *  the height, whatever shape the screen basis happens to be. Subtracting it
+ *  from the sphere normal tilts the surface by the slope.
+ *
+ *  HeightScale converts the height into the same units as the world position.
+ *  The march returns altitude in SHELL FRACTIONS, so this is the shell
+ *  thickness expressed in world units -- Profile.x times whatever scale the
+ *  actor carries. Getting it wrong scales the bumpiness, not its direction, so
+ *  it is safe to tune by eye.
+ *
+ *  TWO LIMITS WORTH KNOWING, because both look like bugs.
+ *
+ *  Screen derivatives are computed per 2x2 quad, so the normal is constant
+ *  across each quad and shows as blockiness under magnification. Nothing can be
+ *  done about that short of differencing the field analytically.
+ *
+ *  And the height is a density-weighted MEAN, not a surface. Where a ray grazes
+ *  the deck it averages over a long path that has no single altitude, so the
+ *  normal there is meaningless -- and at the mesh silhouette the derivative
+ *  reaches across to the background and blows up. Weight the result by opacity
+ *  and by facing, or the limb will read as a bright rim. */
+float3 GG_NormalFromHeight(float3 WorldPos, float3 SphereNormal, float Height, float HeightScale)
+{
+    const float3 N = normalize(SphereNormal);
+
+    const float3 dpx = ddx(WorldPos);
+    const float3 dpy = ddy(WorldPos);
+
+    const float dhx = ddx(Height) * HeightScale;
+    const float dhy = ddy(Height) * HeightScale;
+
+    const float3 r1 = cross(dpy, N);
+    const float3 r2 = cross(N, dpx);
+
+    const float Det = dot(dpx, r1);
+
+	// Degenerate where the quad projects to nothing, which happens at the
+	// silhouette and on backfacing fragments. Returning the sphere normal there
+	// is the right failure: flat rather than exploded.
+    if (abs(Det) < 1e-12f)
+    {
+        return N;
+    }
+
+    const float3 Gradient = (r1 * dhx + r2 * dhy) / Det;
+
+    return normalize(N - Gradient);
+}
+
 /** The band colour ramp. A generalisation of the debug view's diverging ramp.
  *
  *  The debug view picks a colour by the SIGN of vorticity and scales it by the
@@ -715,7 +827,7 @@ float GG_Spot(float3 N, float3 Centre, float Radius, float Strength)
  *  thin enough that sampling at the true radius would shift UVW by far less
  *  than one lattice cell, so it would cost the same and change nothing.
  *
- *  Profile is float4(ShellThickness, TopSoftness, VortexThreshold, CoreDensity).
+ *  Profile is float4(ShellThickness, DensityRamp, VortexThreshold, CoreDensity).
  *
  *  StepHalfLength is half the march step, expressed in SHELL FRACTIONS along
  *  the radius -- the amount of altitude this sample is responsible for. The
@@ -727,8 +839,8 @@ float GG_Spot(float3 N, float3 Centre, float Radius, float Strength)
  *    x  Density in [0,1]. Multiply by an extinction coefficient in the march.
  *    y  BAND MASK, for the colour ramp. NOT a density term.
  *    z  Pressure, for tinting vortices.
- *    w  This sample's own altitude, as a shell fraction. Integrated against
- *       density in the march, it becomes the mean altitude the ray saw.
+ *    w  The deck top at this column, as a shell fraction. The march uses it to
+ *       skip the empty space above the deck instead of stepping through it.
  *
  *  Note the march wants BandSharpness low -- around 0.8. High sharpness
  *  saturates Band toward 0 and 1, which turns the height field into two flat
@@ -754,6 +866,7 @@ float4 GG_Density(
 	float DetailErosion,
 	float DetailDepth,
 	float StepHalfLength,
+	float DensityCurve,
 	float4 Relief,
 	float4 Profile)
 {
@@ -778,107 +891,69 @@ float4 GG_Density(
 	// and those two kinks are visible as hard lines at the cloud top and at the
 	// point the deck goes solid -- the top one especially, since it is the
 	// silhouette. Softening the curve buys more apparent softness than raising
-	// TopSoftness does, and it costs nothing.
-    const float Softness = max(Profile.y, 1e-4f);
 
-	// THE DECK IS A VERTICAL ENVELOPE, NOT THE DENSITY.
+	// THE RAMP IS INTEGRATED ACROSS THE STEP, NOT SAMPLED AT ITS MIDPOINT.
 	//
-	// This is the distinction that decides whether the detail produces
-	// structure or merely a rough surface. The envelope says how much cloud
-	// COULD be here; the noise says how much there is. Multiplying them lets
-	// the noise carve through the whole depth of the deck.
-	//
-	// The previous form modulated the deck by a signed term centred on one, so
-	// deep inside the deck it saturated to solid and the detail could only ever
-	// bite within the softness band. That is a rough surface on an opaque
-	// shell, not cloud -- there was no vertical structure anywhere the envelope
-	// was saturated, which is most of it.
-	// THE ENVELOPE IS INTEGRATED ACROSS THE STEP, NOT SAMPLED AT ITS MIDPOINT.
-	//
-	// One midpoint sample makes the deck a binary decision per step: a step
-	// whose centre lands above Top contributes nothing and one just below
-	// contributes fully, so a step straddling the surface is counted or
-	// discarded whole. As the surface drifts against the step lattice that
-	// flips, and the flip locus is a line on screen -- another artifact of the
-	// sampling rather than of the field.
+	// One midpoint sample makes the deck a near-binary decision per step: a
+	// step whose centre lands above Top contributes nothing and one just below
+	// contributes whatever the ramp has reached. As the surface drifts against
+	// the step lattice that flips, and the flip locus is a line on screen --
+	// an artifact of the sampling rather than of the field.
 	//
 	// The deck top varies slowly across one step, so Top is evaluated once at
-	// the centre and only the ENVELOPE is integrated. That costs two extra
-	// smoothsteps and no extra fetches, which is the whole reason it is worth
-	// doing here rather than by taking more steps.
-	//
-	// Simpson over the step: exact for the cubic that smoothstep already is,
-	// wherever the step lies entirely inside the transition.
+	// the centre and only the RAMP is integrated. Three evaluations of a
+	// closed-form curve, no extra fetches, which is why this is worth doing
+	// here rather than by taking more steps.
     const float HalfStep = max(StepHalfLength, 0.0f);
 
-    const float EnvNear = 1.0f - smoothstep(Top - Softness, Top, Height - HalfStep);
-    const float EnvMid = 1.0f - smoothstep(Top - Softness, Top, Height);
-    const float EnvFar = 1.0f - smoothstep(Top - Softness, Top, Height + HalfStep);
+    const float Ramp = max(Profile.y, 1e-4f);
+    const float Core = max(Profile.w, 0.0f);
 
-    const float Envelope = (EnvNear + 4.0f * EnvMid + EnvFar) / 6.0f;
+    const float RampNear = GG_DensityRamp(Top - (Height - HalfStep), Ramp, DensityCurve, Core);
+    const float RampMid = GG_DensityRamp(Top - Height, Ramp, DensityCurve, Core);
+    const float RampFar = GG_DensityRamp(Top - (Height + HalfStep), Ramp, DensityCurve, Core);
 
-	// THE CARVE FADES WITH DEPTH, WHICH IS WHAT MAKES IT A SKIN.
-	//
-	// Depth below the cloud top, in shell fractions. Zero at the surface,
-	// growing inward.
+	// Simpson across the step.
+    const float Gradient = (RampNear + 4.0f * RampMid + RampFar) / 6.0f;
+
+	// Depth at the sample centre, for the carve falloff only.
     const float Depth = Top - Height;
 
 	// Full erosion at the surface, none below DetailDepth. Without this the
 	// noise carves equally at every depth, so the core never overcomes it and
 	// the deck is uniformly pitted rather than being solid material with a
-	// worked surface -- the carve then has no silhouette to cut into, because
-	// there is no depth at which the cloud is reliably opaque.
+	// worked surface.
 	//
 	// Smoothstep rather than a linear ramp: the point where erosion stops is a
 	// density discontinuity in the depth direction, and a linear falloff leaves
-	// it C0. That shows up edge-on as a faint shelf at a constant altitude,
-	// which reads as a rendering artifact because it is one.
+	// it C0. That shows up edge-on as a faint shelf at a constant altitude.
     const float CarveWeight = 1.0f - smoothstep(0.0f, max(DetailDepth, 1e-4f), Depth);
 
-	// DetailErosion is how hard the noise cuts at the surface; DetailDepth is
-	// how far in it reaches. Together they are the thickness and roughness of
-	// the worked shell, and they are separate because a deep gentle carve and a
-	// shallow violent one look nothing alike.
+	// THE CARVE MODULATES THE GRADIENT AND NOTHING ELSE.
 	//
-	// THE FLOOR IS STILL (1 - DetailErosion) AT THE SURFACE, AND ONE DEEPER.
-	// There is no lower cloud shell, so a fully transparent column would let a
-	// ray reach the backstop, which terminates opaque -- a hard-edged hole
-	// punched through the planet rather than a gap in the cloud. The lerp
-	// cannot produce one; a multiply by the noise could.
+	// Multiplicative, and the gradient is exactly zero above Top, so nothing
+	// the noise does can put density outside the bound GG_TopBounds computed --
+	// which is what keeps the marched span analytically thin.
 	//
-	// Still strictly multiplicative against the envelope, which is what keeps
-	// the marched span analytically thin: the envelope is exactly zero above
-	// Top, so nothing the noise does can put density outside the bound
-	// GG_TopBounds computed.
-	// DENSITY RISES WITH DEPTH, AND THAT IS WHAT MAKES THE BACKSTOP INVISIBLE.
-	//
-	// The envelope saturates at 1 below the fade, so without this the deck has
-	// a flat density all the way down and the optical depth to the inner
-	// backstop is just DensityScale times that constant times the depth. At any
-	// density low enough for the surface carve to be visible, rays reach the
-	// backstop -- which terminates OPAQUE, as a step function, so its
-	// silhouette appears as a hard edge cutting across the shell. It reads as a
-	// clipping plane because that is effectively what it is.
-	//
-	// Real decks compress under their own weight, so a deck that gets denser
-	// with depth is the physical answer as well as the practical one. It also
-	// gives the core something to overcome the carve WITH: the erosion fades
-	// out over DetailDepth while the density climbs, so the two cross and the
-	// worked skin sits on material that is unambiguously solid.
-	//
-	// Profile.w is the multiplier gained per unit of shell depth. It took the
-	// slot the core radius used to occupy, which is free now that there is no
-	// inner sphere -- and it belongs with the rest of the vertical profile.
-	// Linear
-	// rather than exponential: exponential buries the crossover under the
-	// surface at almost any setting, and linear is already enough to put the
-	// backstop out of reach.
-    const float DepthGain = 1.0f + max(Depth, 0.0f) * max(Profile.w, 0.0f);
+	// The lerp floors the carve at (1 - DetailErosion) rather than reaching
+	// zero. There is no lower cloud shell, so a fully transparent column would
+	// let a ray run to the far side of the planet; the lerp cannot produce one
+	// however dark the noise gets, as long as DetailErosion stays below 1.
+    const float Density = Gradient * lerp(1.0f, Field.w, saturate(DetailErosion) * CarveWeight);
 
-    const float Density = Envelope * DepthGain
-		* lerp(1.0f, Field.w, saturate(DetailErosion) * CarveWeight);
-
-	// W IS THIS SAMPLE'S OWN ALTITUDE, NOT THE DECK TOP.
+	// W IS THE DECK TOP AT THIS COLUMN.
+	//
+	// The march needs it for two things. It integrates the sample's own
+	// altitude for the surface report -- and it can compute that itself from
+	// the sample position, so passing it back would waste the channel. What it
+	// cannot compute is where the deck IS, and it needs that to skip the empty
+	// space above it rather than stepping through it.
+	//
+	// OLD NOTE, kept because the reasoning still applies to the altitude the
+	// march integrates: Top is constant down a column, so integrating Top along
+	// the ray returns Top exactly whatever the density did on the way. The
+	// SAMPLE HEIGHT is what varies, and weighting it by density gives the mean
+	// altitude the ray actually saw.
 	//
 	// This is what makes the 3D detail visible at all, and the distinction is
 	// easy to miss. Top is constant down a column: it comes from the flow, and
@@ -894,7 +969,7 @@ float4 GG_Density(
 	// displacement needs one value per column, and a volume does not have one.
 	//
 	// Field.z is the signed band, which is what the colour follows.
-    return float4(Density, Field.z, Field.y, Height);
+    return float4(Density, Field.z, Field.y, Top);
 }
 
 // ---------------------------------------------------------------------------
@@ -1014,10 +1089,8 @@ void GG_TopBounds(float4 Relief, out float OutMin, out float OutMax)
  *                  PlanetRadius. This is the ray origin, so a wrong value moves
  *                  the ray rather than merely biasing step size.
  *
- *  InDensityScale  Extinction multiplier. Because coverage is total, this wants
- *                  to be high enough that the march saturates within a few
- *                  steps of the deck; a low value produces a translucent planet
- *                  that reads as fog rather than as cloud.
+ *  DensityCurve    Onset sharpness. Higher reaches opacity faster; 1 is smooth
+ *                  and 2 or above creases along the deck. See GG_DensityRamp.
  *
  *  InStepBudget    A budget, not a count. See the note in NoiseVolumePreview.
  *  InStepGrowth    Step growth across the marched span.
@@ -1072,9 +1145,9 @@ float4 GG_March(
 	float DetailVertical,
 	float DetailErosion,
 	float DetailDepth,
+	float DensityCurve,
 	float4 Relief,
 	float4 Profile,
-	float InDensityScale,
 	float InStepBudget,
 	float InStepGrowth,
 	int InMaxSteps,
@@ -1089,7 +1162,6 @@ float4 GG_March(
     const float3 Dir = normalize(-InViewVec);
 
     const float Thickness = max(Profile.x, 1e-4f);
-    const float Softness = max(Profile.y, 1e-4f);
 
 	// -- Shell bounds -------------------------------------------------------
 
@@ -1107,7 +1179,19 @@ float4 GG_March(
 	// ray's first sample clear of the density boundary rather than exactly on
 	// it, so the march has a run-up and the entry point stops coinciding with
 	// the one place the field is discontinuous in its derivative.
-    const float OuterRadius = PlanetRadius + Thickness * (TopMax + Softness);
+	// NO MARGIN. Density is exactly zero above Top and Top can never exceed
+	// TopMax, so anything outside this radius is provably empty and padding it
+	// only lengthens the chord a grazing ray has to cross.
+	//
+	// A margin was added earlier to give the ray a run-up rather than landing
+	// its first sample on the density boundary. That is no longer a concern:
+	// the ramp is integrated across each step, so a step straddling the surface
+	// is weighted by how much of it lies inside rather than sampled at a point.
+    const float OuterRadius = PlanetRadius + Thickness * TopMax;
+
+	// Used only for step sizing below, where the ramp's own depth is the scale
+	// the deck has to be resolved against.
+    const float RampDepth = 1.0f / max(Profile.y, 1e-4f);
 
 	// THERE IS NO INNER BOUND. THE DECK HAS A TOP AND NOTHING ELSE.
 	//
@@ -1125,7 +1209,7 @@ float4 GG_March(
 	//
 	// Rays heading inward need no help terminating. Height falls to
 	// -PlanetRadius/Thickness at the centre -- tens of shell depths -- so
-	// DepthGain reaches the hundreds and a single step saturates. The early-out
+	// the ramp saturates long before and a single step goes opaque. The early-out
 	// on transmittance handles it, which is what it is for.
 
     float TEnter, TExit;
@@ -1165,7 +1249,7 @@ float4 GG_March(
 	// the more useful reading -- the deck is the thing being resolved, and how
 	// much empty shell a ray crossed first should not change how finely it is
 	// sampled.
-    const float ReferenceSpan = max(Thickness * (TopMax - TopMin + Softness), 1e-6f);
+    const float ReferenceSpan = max(Thickness * (TopMax - TopMin + RampDepth), 1e-6f);
 
     const float BaseStep = ReferenceSpan / max(InStepBudget, 1.0f);
 
@@ -1265,30 +1349,67 @@ float4 GG_March(
 		// across the whole limb.
         const float3 SampleDir = SamplePos * rsqrt(max(dot(SamplePos, SamplePos), 1e-8f));
 
-        const float StepHalfHeight =
-			abs(dot(Dir, SampleDir)) * StepLen * 0.5f / max(Profile.x, 1e-4f);
+		// How fast altitude changes per unit of ray length. Near zero for a
+		// grazing ray, which is exactly the case the skip below has to handle.
+        const float RadialRate = abs(dot(Dir, SampleDir));
+
+        const float SampleHeight = (length(SamplePos) - PlanetRadius) / Thickness;
+
+        const float StepHalfHeight = RadialRate * StepLen * 0.5f / max(Profile.x, 1e-4f);
 
         const float4 Field = GG_Density(
 			FlowField, FlowSampler, PackedDetail, PackedSampler,
 			SamplePos, PlanetRadius,
 			Time, RigidRate, Scales, Warps, Detail, Layers,
 			BandSharpness, ReliefThinning, DetailVertical, DetailErosion, DetailDepth,
-			StepHalfHeight, Relief, Profile);
+			StepHalfHeight, DensityCurve, Relief, Profile);
 
-        const float Alpha = 1.0f - exp(-Field.x * InDensityScale * StepLen);
+		// No extinction multiplier. Density is already absolute -- CoreDensity is
+		// the density the deck reaches, in world units -- so a separate scale
+		// would only be a second way to say the same thing, and the two would
+		// have to be kept in step by hand.
+        const float Alpha = 1.0f - exp(-Field.x * StepLen);
         const float Weight = Alpha * Transmittance;
 
         Emission += Weight;
         BandAccum += Weight * Field.y;
         Pressure += Weight * Field.z;
 
-        TopAccum += Weight * Field.w;
+        TopAccum += Weight * SampleHeight;
 
         Transmittance *= 1.0f - Alpha;
 
         if (Transmittance < 0.001f)
         {
             break;
+        }
+
+		// EMPTY SPACE IS SKIPPED, NOT STEPPED THROUGH.
+		//
+		// The step size is chosen to resolve the DECK, which is a fraction of a
+		// unit thick. A ray at the limb enters the cull sphere far above the
+		// deck and travels a chord tens of units long before reaching it --
+		// hundreds of steps at the deck's own resolution, against a step budget
+		// sized for the deck.
+		//
+		// So grazing rays exhausted MaxSteps in vacuum and exited transparent,
+		// while rays a fraction of a degree steeper reached density and went
+		// opaque. The threshold between the two is geometric and sharp, and it
+		// drew a hard silhouette exactly where the limb should be softest.
+		//
+		// Above the deck the density is provably zero, so the ray can jump
+		// straight for it. Halved because the deck top varies horizontally and
+		// a neighbouring column may be higher: an underestimate costs a step, an
+		// overestimate steps over the surface.
+		//
+		// Guarded on RadialRate rather than trusting the divide -- a ray running
+		// exactly tangent changes altitude at no rate at all, and the distance
+		// to a deck it never descends toward is not finite.
+        if (SampleHeight > Field.w && RadialRate > 1e-3f)
+        {
+            const float ToDeck = (SampleHeight - Field.w) * Thickness / RadialRate;
+
+            StepLen = max(StepLen, min(ToDeck * 0.5f, Remaining));
         }
 
         T += StepLen;
